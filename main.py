@@ -88,6 +88,7 @@ def run_server():
     )
 
     cameras_by_sid   = {}   # sid  → {id, name}
+    cam_id_to_sid    = {}   # cam_id → laptop sid (for direct emit)
     authed_sids      = set() # sids that passed password check
     viewer_counts    = {}   # cam_id → number of active viewers
     viewers_watching = {}   # viewer_sid → cam_id they are watching
@@ -99,18 +100,22 @@ def run_server():
         return (not PASSWORD_HASH) or (sid in authed_sids)
 
     def viewer_start(cam_id):
-        """Increment viewer count. Tell laptop to start if first viewer."""
+        """Tell laptop to start streaming when first viewer joins."""
         viewer_counts[cam_id] = viewer_counts.get(cam_id, 0) + 1
         if viewer_counts[cam_id] == 1:
-            emit("start_stream", to=f"cam_{cam_id}")
-            print(f"▶  Stream started: {cam_id}")
+            laptop_sid = cam_id_to_sid.get(cam_id)
+            if laptop_sid:
+                sio.emit("start_stream", to=laptop_sid)
+                print(f"▶  Stream started: {cam_id}")
 
     def viewer_stop(cam_id):
-        """Decrement viewer count. Tell laptop to stop if no viewers left."""
+        """Tell laptop to stop streaming when last viewer leaves."""
         viewer_counts[cam_id] = max(0, viewer_counts.get(cam_id, 0) - 1)
         if viewer_counts[cam_id] == 0:
-            emit("stop_stream", to=f"cam_{cam_id}")
-            print(f"⏸  Stream paused:  {cam_id}")
+            laptop_sid = cam_id_to_sid.get(cam_id)
+            if laptop_sid:
+                sio.emit("stop_stream", to=laptop_sid)
+                print(f"⏸  Stream paused:  {cam_id}")
 
     # ── Phone Dashboard HTML ──────────────────────────────────
     VIEWER_HTML = """<!DOCTYPE html>
@@ -466,6 +471,7 @@ body::before{
   position:absolute;top:env(safe-area-inset-top,0px);left:0;right:0;
   padding:16px 16px 0;
   display:flex;align-items:center;gap:12px;
+  pointer-events:auto;
 }
 .back-btn{
   width:38px;height:38px;border-radius:12px;border:none;
@@ -510,6 +516,7 @@ body::before{
   position:absolute;bottom:env(safe-area-inset-bottom,0px);left:0;right:0;
   padding:0 16px 20px;
   display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;
+  pointer-events:auto;
 }
 .cam-switcher::-webkit-scrollbar{display:none}
 
@@ -852,36 +859,36 @@ body::before{
         h = hashlib.sha256(password.encode()).hexdigest()
         if h == PASSWORD_HASH:
             authed_sids.add(flask_request.sid)
-            emit("auth_ok")
+            sio.emit("auth_ok",   to=flask_request.sid)
         else:
-            emit("auth_fail")
+            sio.emit("auth_fail", to=flask_request.sid)
 
     @sio.on("register_camera")
     def on_register(data):
         cam_id   = data.get("id",   flask_request.sid[:6])
         cam_name = data.get("name", f"Camera {cam_id}")
         cameras_by_sid[flask_request.sid] = {"id": cam_id, "name": cam_name}
-        join_room(f"cam_{cam_id}")
+        cam_id_to_sid[cam_id] = flask_request.sid
         print(f"📹 Online:  {cam_name}")
-        emit("camera_list", get_camera_list(), broadcast=True)
+        sio.emit("camera_list", get_camera_list())   # notify all viewers
 
     @sio.on("frame")
     def on_frame(data):
-        cam_id = data.get("id"); frame = data.get("frame")
+        cam_id = data.get("id")
+        frame  = data.get("frame")
         if cam_id and frame:
-            emit("frame", frame, to=f"viewers_{cam_id}")
+            sio.emit("frame", frame, to=f"viewers_{cam_id}")
 
     @sio.on("viewer_join")
     def on_viewer_join():
         if is_authed(flask_request.sid):
-            emit("camera_list", get_camera_list())
+            sio.emit("camera_list", get_camera_list(), to=flask_request.sid)
 
     @sio.on("viewer_watch")
     def on_viewer_watch(cam_id):
         sid = flask_request.sid
         if not is_authed(sid):
             return
-        # Leave previous camera if switching
         if sid in viewers_watching:
             old = viewers_watching[sid]
             if old != cam_id:
@@ -903,17 +910,16 @@ body::before{
     def on_disconnect():
         sid = flask_request.sid
         authed_sids.discard(sid)
-        # Clean up if this was a viewer
         if sid in viewers_watching:
             cam_id = viewers_watching.pop(sid)
             leave_room(f"viewers_{cam_id}")
             viewer_stop(cam_id)
-        # Clean up if this was a laptop
         if sid in cameras_by_sid:
             info = cameras_by_sid.pop(sid)
+            cam_id_to_sid.pop(info["id"], None)
             viewer_counts.pop(info["id"], None)
             print(f"📴 Offline: {info['name']}")
-            emit("camera_list", get_camera_list(), broadcast=True)
+            sio.emit("camera_list", get_camera_list())
 
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀 Multi-camera relay server on port {port}")
@@ -1408,11 +1414,4 @@ if __name__ == "__main__":
     elif "--check" in args:
         run_check()
     elif "--reset" in args:
-        if os.path.exists(MARKER_FILE):
-            os.remove(MARKER_FILE)
-            print("🔄  Reset done — run  python main.py  to redo setup.")
-        else:
-            print("ℹ️   Already fresh — no marker found.")
-    else:
-        first_run_setup()   # runs once on first launch, skipped forever after
-        run_laptop()
+        if os.path.exists(MARKER_F
