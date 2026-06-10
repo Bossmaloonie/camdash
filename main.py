@@ -27,7 +27,7 @@ import subprocess
 # ══════════════════════════════════════════════════════════════
 
 # Your Render relay URL (set after deploying with --server)
-SERVER_URL = "https://YOUR-APP-NAME.onrender.com"
+SERVER_URL = "https://camdash.onrender.com"
 
 # Dashboard password — viewers must enter this to see cameras.
 # Set to "" (empty string) to disable password protection.
@@ -944,7 +944,7 @@ def run_laptop():
 
     sio = sio_lib.Client(
         reconnection=True, reconnection_attempts=0,
-        reconnection_delay=2, max_http_buffer_size=10 * 1024 * 1024,
+        reconnection_delay=2,
     )
 
     @sio.event
@@ -1277,28 +1277,172 @@ def uninstall_startup():
 
 
 # ─────────────────────────────────────────────────────────────
+#  AUTO-INSTALL PACKAGES
+# ─────────────────────────────────────────────────────────────
+
+def auto_install_packages():
+    """Install any missing laptop packages automatically."""
+    packages = [
+        ("cv2",       "opencv-python"),
+        ("socketio",  "python-socketio[client]"),
+        ("websocket", "websocket-client"),
+    ]
+    all_ok = True
+    for mod, pkg in packages:
+        try:
+            __import__(mod)
+        except ImportError:
+            all_ok = False
+            print(f"   📦 Installing {pkg} ...")
+            r = subprocess.run(
+                [sys.executable, "-m", "pip", "install", pkg, "-q"],
+                capture_output=True, text=True
+            )
+            if r.returncode == 0:
+                print(f"   ✅ {pkg} installed")
+            else:
+                print(f"   ❌ Failed to install {pkg}")
+                print(f"      Run manually:  pip install \"{pkg}\"")
+    if all_ok:
+        print("   ✅ All packages already installed")
+
+
+# ─────────────────────────────────────────────────────────────
+#  SAVE SERVER URL BACK INTO THIS FILE
+# ─────────────────────────────────────────────────────────────
+
+def save_server_url(new_url):
+    """Write the new SERVER_URL into this script so it persists."""
+    try:
+        import re
+        with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+        content = re.sub(
+            r'SERVER_URL\s*=\s*"[^"]*"',
+            f'SERVER_URL = "{new_url}"',
+            content, count=1
+        )
+        with open(SCRIPT_PATH, "w", encoding="utf-8") as f:
+            f.write(content)
+        global SERVER_URL
+        SERVER_URL = new_url
+        print(f"   ✅ URL saved — no need to edit the file manually.")
+    except Exception as e:
+        print(f"   ⚠️  Could not save URL automatically: {e}")
+        print(f"      Edit SERVER_URL at the top of main.py manually.")
+
+
+# ─────────────────────────────────────────────────────────────
+#  FIRST-RUN SETUP  (runs once, skipped forever after)
+# ─────────────────────────────────────────────────────────────
+
+MARKER_FILE = os.path.join(SCRIPT_DIR, ".camdash_ready")
+
+def first_run_setup():
+    """
+    Runs automatically on first launch only.
+    Installs packages, saves Render URL, installs auto-startup.
+    After completion a marker file is created so this is
+    never shown again — future runs go straight to streaming.
+    """
+    if os.path.exists(MARKER_FILE):
+        return  # Already configured — skip silently
+
+    print("""
+╔══════════════════════════════════════════════════════╗
+║         CAMDASH — FIRST TIME SETUP                   ║
+║                                                      ║
+║  Setting up everything automatically.                ║
+║  This only runs once — future launches go            ║
+║  straight to streaming.                              ║
+╚══════════════════════════════════════════════════════╝
+""")
+
+    # ── Step 1: Packages ──────────────────────────────────────
+    print("  [1/3] Installing required packages...\n")
+    auto_install_packages()
+    print()
+
+    # ── Step 2: Render URL ────────────────────────────────────
+    print("  [2/3] Render server URL\n")
+    global SERVER_URL
+    if "YOUR-APP-NAME" in SERVER_URL:
+        print("  You need a Render relay URL to connect to.")
+        print("  Follow the GUIDE.md instructions to deploy")
+        print("  the server first, then come back here.\n")
+        while True:
+            url = input("  Paste your Render URL (or press Enter to skip): ").strip().rstrip("/")
+            if url == "":
+                print("  ⚠️  Skipped — edit SERVER_URL in main.py before streaming.\n")
+                break
+            elif url.startswith("https://") and "." in url:
+                save_server_url(url)
+                break
+            else:
+                print("  ❌ Should look like:  https://camdash-xxxx.onrender.com\n")
+    else:
+        print(f"  ✅ SERVER_URL already configured: {SERVER_URL}")
+    print()
+
+    # ── Step 3: Auto-startup ──────────────────────────────────
+    print("  [3/3] Auto-startup\n")
+    print("  This makes the camera stream start automatically")
+    print("  on every boot — no need to open this file again.\n")
+    ans = input("  Install auto-startup? [Y/n]: ").strip().lower()
+    if ans in ("y", "yes", ""):
+        install_startup()
+    else:
+        print("  Skipped. Run  python main.py --install  any time.\n")
+
+    # ── Done ──────────────────────────────────────────────────
+    try:
+        open(MARKER_FILE, "w").write("ready")
+    except Exception:
+        pass
+
+    print()
+    print("  " + "─" * 50)
+    print("  ✅  Setup complete! Starting stream now...")
+    print("  " + "─" * 50 + "\n")
+
+
+# ─────────────────────────────────────────────────────────────
 #  ENTRY POINT
 # ─────────────────────────────────────────────────────────────
 
 def print_help():
     print("""
 ╔══════════════════════════════════════════════════════════╗
-║            MULTI-CAMERA STREAM — USAGE                   ║
+║            CAMDASH — USAGE                               ║
 ╠══════════════════════════════════════════════════════════╣
-║  python main.py              Stream this laptop camera   ║
+║  python main.py              Auto-setup + stream         ║
 ║  python main.py --server     Run relay server (Render)   ║
-║  python main.py --install    One-time setup + perms      ║
+║  python main.py --install    Re-run auto-startup setup   ║
 ║  python main.py --uninstall  Remove auto-start           ║
 ║  python main.py --check      Verify everything is ready  ║
+║  python main.py --reset      Redo first-time setup       ║
 ║  python main.py --help       Show this message           ║
 ╚══════════════════════════════════════════════════════════╝
 """)
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if   "--help"      in args or "-h" in args: print_help()
-    elif "--server"    in args:                  run_server()
-    elif "--install"   in args:                  install_startup()
-    elif "--uninstall" in args:                  uninstall_startup()
-    elif "--check"     in args:                  run_check()
-    else:                                        run_laptop()
+    if "--help" in args or "-h" in args:
+        print_help()
+    elif "--server" in args:
+        run_server()
+    elif "--install" in args:
+        install_startup()
+    elif "--uninstall" in args:
+        uninstall_startup()
+    elif "--check" in args:
+        run_check()
+    elif "--reset" in args:
+        if os.path.exists(MARKER_FILE):
+            os.remove(MARKER_FILE)
+            print("🔄  Reset done — run  python main.py  to redo setup.")
+        else:
+            print("ℹ️   Already fresh — no marker found.")
+    else:
+        first_run_setup()   # runs once on first launch, skipped forever after
+        run_laptop()
