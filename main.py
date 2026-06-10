@@ -13,7 +13,7 @@ Requirements (laptop):
     pip install opencv-python "python-socketio[client]" websocket-client
 
 Requirements (server / Render):
-    pip install flask flask-socketio gevent gevent-websocket
+    pip install flask flask-socketio eventlet
 """
 
 import sys
@@ -32,9 +32,6 @@ SERVER_URL = "https://camdash.onrender.com"
 # Dashboard password — viewers must enter this to see cameras.
 # Set to "" (empty string) to disable password protection.
 DASHBOARD_PASSWORD = "changeme"
-
-# Camera name is taken automatically from the computer's hostname.
-# e.g. "Johns-MacBook", "DESKTOP-AB12CD", "ubuntu-pc" — no setup needed.
 
 # Camera settings
 CAMERA_INDEX  = 0     # 0 = built-in, 1/2 = external webcam
@@ -157,7 +154,6 @@ body{
   -webkit-font-smoothing:antialiased;
 }
 
-/* subtle radial bg glow */
 body::before{
   content:'';
   position:fixed;inset:0;z-index:0;
@@ -256,7 +252,7 @@ body::before{
   display:flex;align-items:center;justify-content:space-between;
   padding:0 20px;
   background:rgba(7,7,14,0.8);
-  backdrop-filter:blur(24px);saturate(180%);
+  backdrop-filter:blur(24px) saturate(180%);
   border-bottom:1px solid rgba(255,255,255,0.06);
 }
 .topbar-left{display:flex;align-items:center;gap:12px}
@@ -327,7 +323,6 @@ body::before{
 }
 @media(min-width:500px){.cam-grid{grid-template-columns:repeat(3,1fr)}}
 
-/* ── Camera Card ── */
 .cam-card{
   border-radius:var(--radius);overflow:hidden;
   background:var(--glass);
@@ -349,7 +344,6 @@ body::before{
   box-shadow:0 0 0 1px rgba(74,222,128,0.1),0 8px 32px rgba(0,0,0,0.4);
 }
 
-/* Thumbnail */
 .cam-thumb{
   width:100%;aspect-ratio:16/9;
   background:#0a0a16;
@@ -368,13 +362,11 @@ body::before{
 }
 .cam-thumb img.loaded ~ .thumb-placeholder{opacity:0}
 
-/* gradient overlay on thumbnail */
 .thumb-grad{
   position:absolute;inset:0;z-index:2;
   background:linear-gradient(to top,rgba(7,7,14,0.85) 0%,transparent 55%);
 }
 
-/* LIVE badge */
 .live-badge{
   position:absolute;top:8px;left:8px;z-index:4;
   display:none;align-items:center;gap:5px;
@@ -393,7 +385,6 @@ body::before{
 }
 @keyframes live-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
 
-/* Card info row */
 .cam-info{
   display:flex;align-items:center;justify-content:space-between;
   padding:10px 12px 11px;
@@ -414,7 +405,6 @@ body::before{
 }
 .cam-card.online  .status-pip{background:var(--accent);box-shadow:0 0 6px rgba(74,222,128,0.5)}
 
-/* ── Empty state ── */
 .empty-state{
   grid-column:1/-1;
   display:flex;flex-direction:column;align-items:center;
@@ -453,7 +443,6 @@ body::before{
 }
 #fullscreen-feed.visible{display:block}
 
-/* Viewer overlay (fades on tap) */
 #viewer-overlay{
   position:absolute;inset:0;z-index:10;
   pointer-events:none;
@@ -461,7 +450,6 @@ body::before{
 }
 #viewer-overlay.fade{opacity:0}
 
-/* Top gradient + bar */
 .viewer-top-grad{
   position:absolute;top:0;left:0;right:0;
   height:140px;
@@ -496,7 +484,6 @@ body::before{
   border-color:rgba(248,113,113,0.35);
 }
 
-/* Viewer placeholder */
 .viewer-ph{
   position:absolute;inset:0;z-index:5;
   display:flex;flex-direction:column;align-items:center;justify-content:center;
@@ -506,7 +493,6 @@ body::before{
 .viewer-ph p{font-size:0.8rem;opacity:.6}
 .viewer-ph.hidden{display:none}
 
-/* Bottom gradient + switcher */
 .viewer-bottom-grad{
   position:absolute;bottom:0;left:0;right:0;
   height:160px;
@@ -539,7 +525,6 @@ body::before{
   color:var(--accent);
 }
 
-/* card entrance animation */
 @keyframes card-in{
   from{opacity:0;transform:translateY(12px)}
   to  {opacity:1;transform:translateY(0)}
@@ -549,7 +534,6 @@ body::before{
 </head>
 <body>
 
-<!-- ═══ LOGIN SCREEN ═══ -->
 <div id="login-screen" class="{{ '' if needs_auth else 'hidden' }}">
   <div class="login-card">
     <div class="login-logo-ring">📷</div>
@@ -564,7 +548,6 @@ body::before{
   </div>
 </div>
 
-<!-- ═══ TOPBAR ═══ -->
 <div class="topbar">
   <div class="topbar-left">
     <div class="logo-ring">📷</div>
@@ -579,7 +562,6 @@ body::before{
   </div>
 </div>
 
-<!-- ═══ MAIN SCROLL VIEW ═══ -->
 <div id="main-view">
   <div id="dashboard">
     <div class="dash-header">
@@ -596,7 +578,6 @@ body::before{
   </div>
 </div>
 
-<!-- ═══ FULLSCREEN VIEWER ═══ -->
 <div id="viewer">
   <div id="viewer-feed-wrap">
     <img id="fullscreen-feed" alt=""/>
@@ -622,6 +603,7 @@ body::before{
   // ── State ───────────────────────────────────────────────────
   const needsAuth  = {{ 'true' if needs_auth else 'false' }};
   let authenticated = !needsAuth;
+  let savedPassword = ''; // FIXED: Remembers token for automatic reconnection auth
   let cameras = {}, currentCam = null, thumbs = {};
 
   // ── Elements ────────────────────────────────────────────────
@@ -645,7 +627,6 @@ body::before{
   const switcher    = document.getElementById('switcher');
   const backBtn     = document.getElementById('back-btn');
 
-  // ── Password toggle ─────────────────────────────────────────
   togglePw.onclick = () => {
     pwInput.type = pwInput.type === 'password' ? 'text' : 'password';
     togglePw.textContent = pwInput.type === 'password' ? '👁' : '🙈';
@@ -657,7 +638,12 @@ body::before{
   socket.on('connect', () => {
     connPill.className = 'conn-pill online';
     connText.textContent = 'Online';
-    if (authenticated) socket.emit('viewer_join');
+    // FIXED: Triggers automatic silent reauth when Render recycles connections
+    if (needsAuth && savedPassword) {
+      socket.emit('authenticate', savedPassword);
+    } else if (!needsAuth) {
+      socket.emit('viewer_join');
+    }
   });
 
   socket.on('disconnect', () => {
@@ -670,9 +656,13 @@ body::before{
     authenticated = true;
     loginScreen.classList.add('hidden');
     socket.emit('viewer_join');
+    if (currentCam) {
+      socket.emit('viewer_watch', currentCam);
+    }
   });
 
   socket.on('auth_fail', () => {
+    savedPassword = ''; // Reset on intentional bad inputs
     pwInput.classList.add('err');
     loginError.textContent = 'Incorrect password. Try again.';
     loginBtn.disabled = false;
@@ -717,6 +707,7 @@ body::before{
     loginBtn.disabled = true;
     loginBtn.textContent = 'Checking...';
     loginError.textContent = '';
+    savedPassword = pw; // FIXED: Caches password in memory to handle reconnections seamlessly
     socket.emit('authenticate', pw);
   }
   loginBtn.onclick = tryLogin;
@@ -814,7 +805,6 @@ body::before{
     viewerPhMsg.textContent = msg;
   }
 
-  // tap feed to toggle overlay
   fsFeed.onclick = () => {
     if (overlay.classList.contains('fade')) { scheduleHide(); }
     else { clearTimeout(hideTimer); overlay.classList.add('fade'); }
@@ -945,7 +935,6 @@ def run_laptop():
     cam_name = socket.gethostname()
     cam_id   = cam_name.lower().replace(" ", "_").replace("-", "_")
 
-    # Controls whether frames are sent — only active when someone watches
     streaming = threading.Event()
 
     sio = sio_lib.Client(
@@ -982,7 +971,6 @@ def run_laptop():
     print(f"🔌 Connecting to {SERVER_URL} as '{cam_name}'...")
     sio.connect(SERVER_URL, transports=["websocket", "polling"])
 
-    # Windows: DirectShow backend is far more reliable
     cap = (cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
            if SYSTEM == "Windows"
            else cv2.VideoCapture(CAMERA_INDEX))
@@ -1009,7 +997,6 @@ def run_laptop():
 
     try:
         while True:
-            # Block here (zero CPU) until a viewer taps this camera
             streaming.wait()
 
             t0  = time.monotonic()
@@ -1094,17 +1081,13 @@ def _run_cmd(cmd, check=True):
     return r
 
 def _grant_camera_permission_macos():
-    """
-    Run a quick camera capture to trigger the macOS permission dialog.
-    Must be done once in the foreground BEFORE installing the background agent.
-    """
     print("📸 Opening camera to trigger macOS permission dialog...")
     print("   → If a popup appears, click OK / Allow.\n")
     try:
         import cv2
         cap = cv2.VideoCapture(CAMERA_INDEX)
         if cap.isOpened():
-            cap.read()   # this line triggers the macOS permission request
+            cap.read()   
             cap.release()
             print("✅  Camera permission granted — will work silently from now on.\n")
             return True
@@ -1120,7 +1103,6 @@ def _grant_camera_permission_macos():
 def install_startup():
     print(f"\n⚙️  Installing auto-startup on {SYSTEM}...\n")
 
-    # ── macOS: grant camera permission FIRST, then install ──────
     if SYSTEM == "Darwin":
         _grant_camera_permission_macos()
 
@@ -1155,7 +1137,6 @@ def install_startup():
         uid_r = subprocess.run(["id", "-u"], capture_output=True, text=True)
         uid   = uid_r.stdout.strip()
 
-        # Modern bootstrap (macOS 11+) with legacy load fallback
         r = _run_cmd(f"launchctl bootstrap gui/{uid} '{plist_path}'", check=False)
         if r.returncode != 0:
             r = _run_cmd(f"launchctl load -w '{plist_path}'")
@@ -1166,9 +1147,8 @@ def install_startup():
         else:
             print("❌  Failed to install launchd agent.")
 
-    # ── Windows ─────────────────────────────────────────────────
     elif SYSTEM == "Windows":
-        exe = _pythonw()   # no console window on boot
+        exe = _pythonw()   
 
         xml = f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -1211,10 +1191,8 @@ def install_startup():
         else:
             print("❌  Failed. Try running this script as Administrator.")
 
-        # Windows does not require a separate permission step — camera just works.
         print("\n✅  No extra permission steps needed on Windows.")
 
-    # ── Linux ────────────────────────────────────────────────────
     elif SYSTEM == "Linux":
         svc_dir  = os.path.expanduser("~/.config/systemd/user")
         svc_path = os.path.join(svc_dir, f"{SERVICE_NAME}.service")
@@ -1345,14 +1323,8 @@ def save_server_url(new_url):
 MARKER_FILE = os.path.join(SCRIPT_DIR, ".camdash_ready")
 
 def first_run_setup():
-    """
-    Runs automatically on first launch only — fully silent, no prompts.
-    Installs packages and auto-startup without asking any questions.
-    After this, future runs go straight to streaming.
-    Camera only activates when someone taps it on the phone dashboard.
-    """
     if os.path.exists(MARKER_FILE):
-        return  # Already configured — skip silently
+        return  
 
     print("""
 ╔══════════════════════════════════════════════════════╗
@@ -1360,16 +1332,13 @@ def first_run_setup():
 ╚══════════════════════════════════════════════════════╝
 """)
 
-    # ── Step 1: Install packages silently ─────────────────────
     print("  [1/2] Installing required packages...")
     auto_install_packages()
     print()
 
-    # ── Step 2: Install auto-startup silently ─────────────────
     print("  [2/2] Installing auto-startup...")
     install_startup()
 
-    # ── Mark setup as done ────────────────────────────────────
     try:
         open(MARKER_FILE, "w").write("ready")
     except Exception:
@@ -1414,4 +1383,11 @@ if __name__ == "__main__":
     elif "--check" in args:
         run_check()
     elif "--reset" in args:
-        if os.path.exists(MARKER_F
+        if os.path.exists(MARKER_FILE):
+            os.remove(MARKER_FILE)
+            print("🔄  Reset done — run  python main.py  to redo setup.")
+        else:
+            print("ℹ️   Already fresh — no marker found.")
+    else:
+        first_run_setup()   
+        run_laptop()
