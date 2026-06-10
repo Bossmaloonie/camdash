@@ -950,8 +950,8 @@ def run_laptop():
     @sio.event
     def connect():
         print(f"✅ Connected as '{cam_name}'")
-        print(f"   📱 Dashboard: {SERVER_URL}")
-        print(f"   ⏸  Standby — waiting for a viewer to tap this camera\n")
+        print(f"   📱 Open on phone : {SERVER_URL}")
+        print(f"   🔒 Camera is OFF  — turns on only when you tap it on the dashboard\n")
         sio.emit("register_camera", {"id": cam_id, "name": cam_name})
 
     @sio.event
@@ -965,12 +965,12 @@ def run_laptop():
 
     @sio.on("start_stream")
     def on_start_stream():
-        print(f"▶  Viewer connected — streaming '{cam_name}'")
+        print(f"📷 Camera ON  — someone is watching '{cam_name}'")
         streaming.set()
 
     @sio.on("stop_stream")
     def on_stop_stream():
-        print(f"⏸  No viewers — '{cam_name}' is on standby")
+        print(f"🔒 Camera OFF — no viewers, standby")
         streaming.clear()
 
     print(f"🔌 Connecting to {SERVER_URL} as '{cam_name}'...")
@@ -1340,61 +1340,30 @@ MARKER_FILE = os.path.join(SCRIPT_DIR, ".camdash_ready")
 
 def first_run_setup():
     """
-    Runs automatically on first launch only.
-    Installs packages, saves Render URL, installs auto-startup.
-    After completion a marker file is created so this is
-    never shown again — future runs go straight to streaming.
+    Runs automatically on first launch only — fully silent, no prompts.
+    Installs packages and auto-startup without asking any questions.
+    After this, future runs go straight to streaming.
+    Camera only activates when someone taps it on the phone dashboard.
     """
     if os.path.exists(MARKER_FILE):
         return  # Already configured — skip silently
 
     print("""
 ╔══════════════════════════════════════════════════════╗
-║         CAMDASH — FIRST TIME SETUP                   ║
-║                                                      ║
-║  Setting up everything automatically.                ║
-║  This only runs once — future launches go            ║
-║  straight to streaming.                              ║
+║         CAMDASH — SETTING UP (first time only)       ║
 ╚══════════════════════════════════════════════════════╝
 """)
 
-    # ── Step 1: Packages ──────────────────────────────────────
-    print("  [1/3] Installing required packages...\n")
+    # ── Step 1: Install packages silently ─────────────────────
+    print("  [1/2] Installing required packages...")
     auto_install_packages()
     print()
 
-    # ── Step 2: Render URL ────────────────────────────────────
-    print("  [2/3] Render server URL\n")
-    global SERVER_URL
-    if "YOUR-APP-NAME" in SERVER_URL:
-        print("  You need a Render relay URL to connect to.")
-        print("  Follow the GUIDE.md instructions to deploy")
-        print("  the server first, then come back here.\n")
-        while True:
-            url = input("  Paste your Render URL (or press Enter to skip): ").strip().rstrip("/")
-            if url == "":
-                print("  ⚠️  Skipped — edit SERVER_URL in main.py before streaming.\n")
-                break
-            elif url.startswith("https://") and "." in url:
-                save_server_url(url)
-                break
-            else:
-                print("  ❌ Should look like:  https://camdash-xxxx.onrender.com\n")
-    else:
-        print(f"  ✅ SERVER_URL already configured: {SERVER_URL}")
-    print()
+    # ── Step 2: Install auto-startup silently ─────────────────
+    print("  [2/2] Installing auto-startup...")
+    install_startup()
 
-    # ── Step 3: Auto-startup ──────────────────────────────────
-    print("  [3/3] Auto-startup\n")
-    print("  This makes the camera stream start automatically")
-    print("  on every boot — no need to open this file again.\n")
-    ans = input("  Install auto-startup? [Y/n]: ").strip().lower()
-    if ans in ("y", "yes", ""):
-        install_startup()
-    else:
-        print("  Skipped. Run  python main.py --install  any time.\n")
-
-    # ── Done ──────────────────────────────────────────────────
+    # ── Mark setup as done ────────────────────────────────────
     try:
         open(MARKER_FILE, "w").write("ready")
     except Exception:
@@ -1402,7 +1371,8 @@ def first_run_setup():
 
     print()
     print("  " + "─" * 50)
-    print("  ✅  Setup complete! Starting stream now...")
+    print("  ✅  Setup complete! Starting stream...")
+    print("  ✅  Camera activates only when viewed on phone.")
     print("  " + "─" * 50 + "\n")
 
 
