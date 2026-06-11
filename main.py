@@ -13,7 +13,7 @@ Requirements (laptop):
     pip install opencv-python "python-socketio[client]" websocket-client
 
 Requirements (server / Render):
-    pip install flask flask-socketio eventlet
+    pip install flask flask-socketio gevent gevent-websocket
 """
 
 import sys
@@ -32,6 +32,9 @@ SERVER_URL = "https://camdash.onrender.com"
 # Dashboard password — viewers must enter this to see cameras.
 # Set to "" (empty string) to disable password protection.
 DASHBOARD_PASSWORD = "changeme"
+
+# Camera name is taken automatically from the computer's hostname.
+# e.g. "Johns-MacBook", "DESKTOP-AB12CD", "ubuntu-pc" — no setup needed.
 
 # Camera settings
 CAMERA_INDEX  = 0     # 0 = built-in, 1/2 = external webcam
@@ -84,35 +87,15 @@ def run_server():
         async_mode="eventlet", ping_timeout=60, ping_interval=25,
     )
 
-    cameras_by_sid   = {}   # sid  → {id, name}
-    cam_id_to_sid    = {}   # cam_id → laptop sid (for direct emit)
-    authed_sids      = set() # sids that passed password check
-    viewer_counts    = {}   # cam_id → number of active viewers
-    viewers_watching = {}   # viewer_sid → cam_id they are watching
+    cameras_by_sid   = {}   # sid → {id, name}
+    authed_sids      = set() # authenticated viewer sids
+    viewers_watching = {}   # viewer sid → cam_id being watched
 
     def get_camera_list():
         return [{"id": v["id"], "name": v["name"]} for v in cameras_by_sid.values()]
 
     def is_authed(sid):
         return (not PASSWORD_HASH) or (sid in authed_sids)
-
-    def viewer_start(cam_id):
-        """Tell laptop to start streaming when first viewer joins."""
-        viewer_counts[cam_id] = viewer_counts.get(cam_id, 0) + 1
-        if viewer_counts[cam_id] == 1:
-            laptop_sid = cam_id_to_sid.get(cam_id)
-            if laptop_sid:
-                sio.emit("start_stream", to=laptop_sid)
-                print(f"▶  Stream started: {cam_id}")
-
-    def viewer_stop(cam_id):
-        """Tell laptop to stop streaming when last viewer leaves."""
-        viewer_counts[cam_id] = max(0, viewer_counts.get(cam_id, 0) - 1)
-        if viewer_counts[cam_id] == 0:
-            laptop_sid = cam_id_to_sid.get(cam_id)
-            if laptop_sid:
-                sio.emit("stop_stream", to=laptop_sid)
-                print(f"⏸  Stream paused:  {cam_id}")
 
     # ── Phone Dashboard HTML ──────────────────────────────────
     VIEWER_HTML = """<!DOCTYPE html>
@@ -121,711 +104,355 @@ def run_server():
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <title>CamDash</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-
 :root{
-  --bg:#07070e;
-  --bg2:#0d0d1c;
-  --glass:rgba(255,255,255,0.035);
-  --glass-hover:rgba(255,255,255,0.065);
-  --border:rgba(255,255,255,0.07);
-  --border-hover:rgba(255,255,255,0.14);
-  --accent:#4ade80;
-  --accent2:#22d3ee;
-  --accent-glow:rgba(74,222,128,0.18);
-  --accent-glow2:rgba(74,222,128,0.06);
-  --red:#f87171;
-  --red-glow:rgba(248,113,113,0.25);
-  --text:#eeeef5;
-  --text2:#9999b8;
-  --text3:#44445a;
-  --radius:18px;
-  --radius-sm:12px;
+  --bg:#08080f;--card:#111118;--border:#1c1c28;
+  --accent:#4ade80;--red:#f87171;
+  --text:#eeeeee;--muted:#555570;
 }
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;min-height:100dvh}
 
-html,body{height:100%;overflow:hidden}
-body{
-  font-family:'Inter',system-ui,sans-serif;
-  background:var(--bg);
-  color:var(--text);
-  -webkit-font-smoothing:antialiased;
-}
+/* ── LOGIN ── */
+#login{position:fixed;inset:0;z-index:200;background:var(--bg);
+  display:flex;align-items:center;justify-content:center;padding:24px}
+#login.hide{display:none}
+.lcard{width:100%;max-width:340px;background:var(--card);border:1px solid var(--border);
+  border-radius:20px;padding:36px 28px;display:flex;flex-direction:column;align-items:center;gap:16px}
+.licon{font-size:2.8rem}
+.ltitle{font-size:1.05rem;font-weight:700;letter-spacing:.06em}
+.lsub{font-size:.78rem;color:var(--muted);text-align:center}
+#pw{width:100%;padding:13px 16px;background:rgba(255,255,255,.05);
+  border:1px solid var(--border);border-radius:12px;
+  color:var(--text);font-size:1rem;outline:none}
+#pw:focus{border-color:rgba(74,222,128,.5)}
+#pw.shake{animation:sh .35s}
+@keyframes sh{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
+#lbtn{width:100%;padding:13px;border:none;border-radius:12px;
+  background:var(--accent);color:#052e16;font-size:.9rem;font-weight:700;cursor:pointer}
+#lerr{font-size:.76rem;color:var(--red);min-height:16px;text-align:center}
 
-body::before{
-  content:'';
-  position:fixed;inset:0;z-index:0;
-  background:
-    radial-gradient(ellipse 80% 50% at 50% -10%,rgba(74,222,128,0.06) 0%,transparent 60%),
-    radial-gradient(ellipse 60% 40% at 100% 100%,rgba(34,211,238,0.04) 0%,transparent 50%);
-  pointer-events:none;
-}
+/* ── TOPBAR ── */
+.topbar{position:sticky;top:0;z-index:50;background:rgba(8,8,15,.9);
+  backdrop-filter:blur(16px);border-bottom:1px solid var(--border);
+  padding:14px 16px;display:flex;align-items:center;justify-content:space-between}
+.tlogo{font-size:1.1rem;font-weight:700;letter-spacing:.06em}
+.tsub{font-size:.68rem;color:var(--muted);margin-top:2px}
+.tpill{display:flex;align-items:center;gap:6px;padding:4px 12px 4px 8px;
+  border-radius:999px;background:rgba(255,255,255,.04);border:1px solid var(--border);
+  font-size:.7rem;color:var(--muted)}
+.tpill.on{background:rgba(74,222,128,.1);border-color:rgba(74,222,128,.3);color:var(--accent)}
+.tdot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+.tpill.on .tdot{background:var(--accent);animation:pd 2s infinite}
+@keyframes pd{0%,100%{opacity:1}50%{opacity:.3}}
 
-/* ═══════════════════════ LOGIN ═══════════════════════ */
-#login-screen{
-  position:fixed;inset:0;z-index:300;
-  display:flex;align-items:center;justify-content:center;
-  padding:24px;
-  background:var(--bg);
-}
-#login-screen.hidden{display:none}
+/* ── DASHBOARD ── */
+#dash{padding:16px}
+.dlabel{font-size:.65rem;color:var(--muted);letter-spacing:.12em;text-transform:uppercase;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
 
-.login-card{
-  width:100%;max-width:360px;
-  background:rgba(255,255,255,0.03);
-  border:1px solid rgba(255,255,255,0.08);
-  border-radius:28px;
-  padding:40px 32px 36px;
-  box-shadow:0 0 0 1px rgba(74,222,128,0.06),0 32px 80px rgba(0,0,0,0.6),inset 0 1px 0 rgba(255,255,255,0.06);
-  display:flex;flex-direction:column;align-items:center;gap:0;
-  backdrop-filter:blur(40px);
-}
+/* ── CAMERA CARD ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;
+  overflow:hidden;cursor:pointer;transition:border-color .2s,transform .15s}
+.card:active{transform:scale(.96)}
+.card:hover{border-color:#303040}
+.thumb{width:100%;aspect-ratio:16/9;background:#0c0c18;position:relative;
+  display:flex;align-items:center;justify-content:center;font-size:1.8rem;overflow:hidden}
+.thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none}
+.thumb img.ok{display:block}
+.livebadge{position:absolute;top:7px;left:7px;display:none;align-items:center;gap:5px;
+  padding:2px 8px;border-radius:6px;background:rgba(0,0,0,.7);
+  border:1px solid rgba(248,113,113,.5);font-size:.58rem;font-weight:700;letter-spacing:.08em}
+.card.live .livebadge{display:flex}
+.rdot{width:6px;height:6px;border-radius:50%;background:var(--red);animation:ld 1s infinite}
+@keyframes ld{0%,100%{opacity:1}50%{opacity:.3}}
+.cinfo{padding:9px 12px 11px}
+.cname{font-size:.82rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cstatus{font-size:.67rem;margin-top:3px;display:flex;align-items:center;gap:5px;color:var(--muted)}
+.sdot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0}
+.card.online .sdot{background:var(--accent)}
+.card.online .cstatus{color:var(--accent)}
 
-.login-logo-ring{
-  width:72px;height:72px;border-radius:50%;
-  background:radial-gradient(circle at 35% 35%,rgba(74,222,128,0.25),rgba(74,222,128,0.05));
-  border:1px solid rgba(74,222,128,0.3);
-  display:flex;align-items:center;justify-content:center;
-  font-size:1.8rem;margin-bottom:24px;
-  box-shadow:0 0 32px rgba(74,222,128,0.15),0 0 80px rgba(74,222,128,0.06);
-}
+/* ── EMPTY STATE ── */
+.empty{grid-column:1/-1;display:flex;flex-direction:column;align-items:center;
+  padding:60px 20px;gap:12px;color:var(--muted);text-align:center}
+.empty .eicon{font-size:2.5rem;opacity:.3}
+.empty p{font-size:.8rem;line-height:1.6}
+.empty code{color:var(--accent);font-family:monospace;
+  background:rgba(74,222,128,.08);padding:1px 6px;border-radius:4px}
 
-.login-title{
-  font-size:1.15rem;font-weight:700;letter-spacing:0.12em;
-  text-transform:uppercase;margin-bottom:6px;
-  background:linear-gradient(135deg,#fff 0%,rgba(255,255,255,0.6) 100%);
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-}
-.login-sub{font-size:0.78rem;color:var(--text2);margin-bottom:28px;letter-spacing:0.01em}
-
-.input-group{width:100%;position:relative;margin-bottom:12px}
-.input-group input{
-  width:100%;padding:14px 48px 14px 18px;
-  background:rgba(255,255,255,0.05);
-  border:1px solid rgba(255,255,255,0.1);
-  border-radius:var(--radius-sm);
-  color:var(--text);font-size:0.95rem;font-family:'Inter',sans-serif;
-  outline:none;transition:border-color 0.2s,box-shadow 0.2s;
-  letter-spacing:0.08em;
-}
-.input-group input::placeholder{color:var(--text3);letter-spacing:0.01em}
-.input-group input:focus{
-  border-color:rgba(74,222,128,0.5);
-  box-shadow:0 0 0 3px rgba(74,222,128,0.1);
-}
-.input-group input.err{
-  border-color:rgba(248,113,113,0.6);
-  box-shadow:0 0 0 3px rgba(248,113,113,0.1);
-  animation:shake .35s ease;
-}
-@keyframes shake{0%,100%{transform:translateX(0)}20%,60%{transform:translateX(-6px)}40%,80%{transform:translateX(6px)}}
-
-.toggle-pw{
-  position:absolute;right:14px;top:50%;transform:translateY(-50%);
-  background:none;border:none;color:var(--text3);cursor:pointer;
-  font-size:1rem;padding:4px;line-height:1;transition:color 0.2s;
-}
-.toggle-pw:hover{color:var(--text2)}
-
-.login-btn{
-  width:100%;padding:14px;border:none;border-radius:var(--radius-sm);
-  font-size:0.9rem;font-weight:600;font-family:'Inter',sans-serif;
-  cursor:pointer;margin-top:4px;letter-spacing:0.04em;
-  background:linear-gradient(135deg,#4ade80 0%,#22c55e 100%);
-  color:#052e16;transition:opacity 0.2s,transform 0.15s;
-  box-shadow:0 4px 20px rgba(74,222,128,0.3);
-}
-.login-btn:active{opacity:.85;transform:scale(.98)}
-.login-btn:disabled{opacity:.5;cursor:not-allowed}
-
-.login-error{
-  font-size:0.75rem;color:var(--red);text-align:center;
-  margin-top:10px;min-height:16px;letter-spacing:0.01em;
-}
-
-/* ═══════════════════════ TOPBAR ═══════════════════════ */
-.topbar{
-  position:fixed;top:0;left:0;right:0;z-index:100;
-  height:64px;
-  display:flex;align-items:center;justify-content:space-between;
-  padding:0 20px;
-  background:rgba(7,7,14,0.8);
-  backdrop-filter:blur(24px) saturate(180%);
-  border-bottom:1px solid rgba(255,255,255,0.06);
-}
-.topbar-left{display:flex;align-items:center;gap:12px}
-.logo-ring{
-  width:36px;height:36px;border-radius:10px;
-  background:linear-gradient(135deg,rgba(74,222,128,0.2),rgba(34,211,238,0.1));
-  border:1px solid rgba(74,222,128,0.25);
-  display:flex;align-items:center;justify-content:center;font-size:1.05rem;
-}
-.topbar-title{
-  font-size:0.95rem;font-weight:700;letter-spacing:0.08em;
-  text-transform:uppercase;
-  background:linear-gradient(90deg,#fff,rgba(255,255,255,0.7));
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-}
-.topbar-sub{font-size:0.67rem;color:var(--text3);margin-top:1px;font-family:'JetBrains Mono',monospace}
-
-.conn-pill{
-  display:flex;align-items:center;gap:6px;
-  padding:5px 12px 5px 8px;border-radius:999px;
-  background:rgba(255,255,255,0.04);
-  border:1px solid rgba(255,255,255,0.08);
-  font-size:0.7rem;color:var(--text2);letter-spacing:0.02em;
-  transition:all 0.3s;
-}
-.conn-pill.online{background:rgba(74,222,128,0.08);border-color:rgba(74,222,128,0.2);color:var(--accent)}
-.conn-pill.offline{background:rgba(248,113,113,0.08);border-color:rgba(248,113,113,0.2);color:var(--red)}
-
-.conn-dot{
-  width:7px;height:7px;border-radius:50%;
-  background:var(--text3);transition:background 0.3s;
-}
-.conn-pill.online  .conn-dot{background:var(--accent);box-shadow:0 0 6px var(--accent);animation:pulse-dot 2s infinite}
-.conn-pill.offline .conn-dot{background:var(--red)}
-@keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.4}}
-
-/* ═══════════════════════ DASHBOARD ═══════════════════════ */
-#main-view{
-  position:fixed;inset:0;
-  padding-top:64px;
-  overflow-y:auto;
-  -webkit-overflow-scrolling:touch;
-  z-index:10;
-}
-#main-view::-webkit-scrollbar{display:none}
-
-#dashboard{padding:20px 16px 32px}
-
-.dash-header{
-  display:flex;align-items:center;justify-content:space-between;
-  margin-bottom:16px;
-}
-.section-label{
-  font-size:0.65rem;font-weight:600;letter-spacing:0.14em;
-  text-transform:uppercase;color:var(--text3);
-}
-.cam-count-chip{
-  font-size:0.65rem;font-family:'JetBrains Mono',monospace;
-  padding:3px 9px;border-radius:999px;
-  background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);
-  color:var(--text3);
-}
-
-.cam-grid{
-  display:grid;
-  grid-template-columns:repeat(2,1fr);
-  gap:12px;
-}
-@media(min-width:500px){.cam-grid{grid-template-columns:repeat(3,1fr)}}
-
-.cam-card{
-  border-radius:var(--radius);overflow:hidden;
-  background:var(--glass);
-  border:1px solid var(--border);
-  cursor:pointer;
-  transition:transform 0.2s ease,border-color 0.25s,box-shadow 0.25s;
-  -webkit-tap-highlight-color:transparent;
-  position:relative;
-}
-.cam-card::after{
-  content:'';position:absolute;inset:0;border-radius:var(--radius);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.07);
-  pointer-events:none;
-}
-.cam-card:active{transform:scale(0.96)}
-.cam-card:hover,
-.cam-card.streaming{
-  border-color:rgba(74,222,128,0.25);
-  box-shadow:0 0 0 1px rgba(74,222,128,0.1),0 8px 32px rgba(0,0,0,0.4);
-}
-
-.cam-thumb{
-  width:100%;aspect-ratio:16/9;
-  background:#0a0a16;
-  position:relative;overflow:hidden;
-  display:flex;align-items:center;justify-content:center;
-}
-.cam-thumb img{
-  position:absolute;inset:0;width:100%;height:100%;
-  object-fit:cover;opacity:0;transition:opacity 0.4s ease;
-}
-.cam-thumb img.loaded{opacity:1}
-.thumb-placeholder{
-  font-size:1.6rem;opacity:0.15;
-  position:absolute;z-index:1;
-  transition:opacity 0.3s;
-}
-.cam-thumb img.loaded ~ .thumb-placeholder{opacity:0}
-
-.thumb-grad{
-  position:absolute;inset:0;z-index:2;
-  background:linear-gradient(to top,rgba(7,7,14,0.85) 0%,transparent 55%);
-}
-
-.live-badge{
-  position:absolute;top:8px;left:8px;z-index:4;
-  display:none;align-items:center;gap:5px;
-  padding:3px 8px;border-radius:6px;
-  background:rgba(0,0,0,0.65);
-  border:1px solid rgba(248,113,113,0.4);
-  font-size:0.58rem;font-weight:700;letter-spacing:0.1em;color:#fff;
-  backdrop-filter:blur(8px);
-}
-.cam-card.streaming .live-badge{display:flex}
-.live-dot{
-  width:6px;height:6px;border-radius:50%;
-  background:var(--red);
-  box-shadow:0 0 6px var(--red);
-  animation:live-pulse 1.2s ease infinite;
-}
-@keyframes live-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
-
-.cam-info{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:10px 12px 11px;
-}
-.cam-name{
-  font-size:0.8rem;font-weight:600;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;
-  color:var(--text);
-}
-.cam-sub{
-  font-size:0.64rem;color:var(--text3);margin-top:2px;
-  font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;
-}
-.cam-card.online  .cam-sub{color:var(--accent)}
-.status-pip{
-  width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-left:8px;
-  background:var(--text3);
-}
-.cam-card.online  .status-pip{background:var(--accent);box-shadow:0 0 6px rgba(74,222,128,0.5)}
-
-.empty-state{
-  grid-column:1/-1;
-  display:flex;flex-direction:column;align-items:center;
-  padding:60px 20px;gap:12px;text-align:center;
-}
-.empty-icon-box{
-  width:72px;height:72px;border-radius:20px;
-  background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);
-  display:flex;align-items:center;justify-content:center;font-size:2rem;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.06);
-}
-.empty-state h3{font-size:0.9rem;font-weight:600;color:var(--text2)}
-.empty-state p{font-size:0.77rem;color:var(--text3);line-height:1.6}
-.empty-state code{
-  font-family:'JetBrains Mono',monospace;font-size:0.72rem;
-  color:var(--accent);background:rgba(74,222,128,0.08);
-  padding:1px 6px;border-radius:4px;
-}
-
-/* ═══════════════════════ FULLSCREEN VIEWER ═══════════════════════ */
-#viewer{
-  position:fixed;inset:0;z-index:200;
-  background:#000;
-  display:none;flex-direction:column;
-  transition:opacity 0.25s;
-}
+/* ── FULLSCREEN VIEWER ── */
+#viewer{display:none;position:fixed;inset:0;z-index:100;background:#000;flex-direction:column}
 #viewer.open{display:flex}
 
-#viewer-feed-wrap{
-  position:absolute;inset:0;
-  display:flex;align-items:center;justify-content:center;
-}
-#fullscreen-feed{
-  width:100%;height:100%;object-fit:contain;
-  display:none;
-}
-#fullscreen-feed.visible{display:block}
+/* viewer top bar — standalone, no overlay parent */
+#vtop{position:absolute;top:0;left:0;right:0;z-index:10;
+  background:linear-gradient(to bottom,rgba(0,0,0,.8),transparent);
+  padding:env(safe-area-inset-top,16px) 16px 32px;
+  display:flex;align-items:center;gap:12px}
+#vback{width:38px;height:38px;border-radius:11px;border:1px solid rgba(255,255,255,.15);
+  background:rgba(255,255,255,.1);color:#fff;font-size:1.1rem;
+  cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  -webkit-tap-highlight-color:transparent}
+#vname{font-size:.95rem;font-weight:600}
+#vbadge{margin-left:auto;font-size:.65rem;padding:3px 10px;border-radius:999px;
+  background:rgba(0,0,0,.5);color:rgba(255,255,255,.5);
+  border:1px solid rgba(255,255,255,.12);white-space:nowrap}
+#vbadge.live{background:rgba(248,113,113,.2);color:var(--red);border-color:rgba(248,113,113,.4)}
 
-#viewer-overlay{
-  position:absolute;inset:0;z-index:10;
-  pointer-events:none;
-  transition:opacity 0.35s ease;
-}
-#viewer-overlay.fade{opacity:0}
+/* feed */
+#vfeed{position:absolute;inset:0;display:none;width:100%;height:100%;object-fit:contain}
+#vfeed.show{display:block}
+#vph{position:absolute;inset:0;z-index:5;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:12px;color:rgba(255,255,255,.2)}
+#vph .vi{font-size:3rem;opacity:.3}
+#vph.hide{display:none}
 
-.viewer-top-grad{
-  position:absolute;top:0;left:0;right:0;
-  height:140px;
-  background:linear-gradient(to bottom,rgba(0,0,0,0.8) 0%,transparent 100%);
-}
-.viewer-topbar{
-  position:absolute;top:env(safe-area-inset-top,0px);left:0;right:0;
-  padding:16px 16px 0;
-  display:flex;align-items:center;gap:12px;
-  pointer-events:auto;
-}
-.back-btn{
-  width:38px;height:38px;border-radius:12px;border:none;
-  background:rgba(255,255,255,0.1);
-  backdrop-filter:blur(12px);
-  color:#fff;font-size:1rem;cursor:pointer;
-  display:flex;align-items:center;justify-content:center;flex-shrink:0;
-  -webkit-tap-highlight-color:transparent;
-  border:1px solid rgba(255,255,255,0.12);
-}
-.viewer-name{font-size:0.95rem;font-weight:600;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,0.5)}
-.viewer-badge{
-  margin-left:auto;
-  font-size:0.65rem;font-weight:600;padding:4px 10px;border-radius:999px;
-  background:rgba(0,0,0,0.5);color:rgba(255,255,255,0.5);
-  border:1px solid rgba(255,255,255,0.12);
-  backdrop-filter:blur(8px);white-space:nowrap;
-  letter-spacing:0.04em;
-}
-.viewer-badge.live{
-  background:rgba(248,113,113,0.2);color:var(--red);
-  border-color:rgba(248,113,113,0.35);
-}
-
-.viewer-ph{
-  position:absolute;inset:0;z-index:5;
-  display:flex;flex-direction:column;align-items:center;justify-content:center;
-  gap:12px;color:rgba(255,255,255,0.2);
-}
-.viewer-ph .icon{font-size:3rem;opacity:.4}
-.viewer-ph p{font-size:0.8rem;opacity:.6}
-.viewer-ph.hidden{display:none}
-
-.viewer-bottom-grad{
-  position:absolute;bottom:0;left:0;right:0;
-  height:160px;
-  background:linear-gradient(to top,rgba(0,0,0,0.85) 0%,transparent 100%);
-}
-.cam-switcher{
-  position:absolute;bottom:env(safe-area-inset-bottom,0px);left:0;right:0;
-  padding:0 16px 20px;
-  display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;
-  pointer-events:auto;
-}
-.cam-switcher::-webkit-scrollbar{display:none}
-
-.sw-btn{
-  flex-shrink:0;display:flex;align-items:center;gap:6px;
-  padding:7px 14px;border-radius:999px;
-  border:1px solid rgba(255,255,255,0.12);
-  background:rgba(255,255,255,0.07);
-  color:rgba(255,255,255,0.55);font-size:0.75rem;
-  font-family:'Inter',sans-serif;font-weight:500;
-  cursor:pointer;white-space:nowrap;
-  -webkit-tap-highlight-color:transparent;
-  backdrop-filter:blur(12px);
-  transition:all 0.2s;
-}
-.sw-dot{width:6px;height:6px;border-radius:50%;background:var(--accent)}
-.sw-btn.active{
-  border-color:rgba(74,222,128,0.4);
-  background:rgba(74,222,128,0.12);
-  color:var(--accent);
-}
-
-@keyframes card-in{
-  from{opacity:0;transform:translateY(12px)}
-  to  {opacity:1;transform:translateY(0)}
-}
-.cam-card{animation:card-in 0.3s ease both}
+/* viewer bottom switcher — standalone, no overlay parent */
+#vsw{position:absolute;bottom:0;left:0;right:0;z-index:10;
+  background:linear-gradient(to top,rgba(0,0,0,.85),transparent);
+  padding:32px 16px env(safe-area-inset-bottom,16px);
+  display:flex;gap:8px;overflow-x:auto;scrollbar-width:none}
+#vsw::-webkit-scrollbar{display:none}
+.swbtn{flex-shrink:0;display:flex;align-items:center;gap:6px;padding:7px 14px;
+  border-radius:999px;border:1px solid rgba(255,255,255,.15);
+  background:rgba(255,255,255,.08);color:rgba(255,255,255,.6);
+  font-size:.75rem;cursor:pointer;white-space:nowrap;
+  -webkit-tap-highlight-color:transparent}
+.swbtn .sd{width:6px;height:6px;border-radius:50%;background:var(--accent)}
+.swbtn.cur{border-color:rgba(74,222,128,.5);color:var(--accent);background:rgba(74,222,128,.12)}
 </style>
 </head>
 <body>
 
-<div id="login-screen" class="{{ '' if needs_auth else 'hidden' }}">
-  <div class="login-card">
-    <div class="login-logo-ring">📷</div>
-    <div class="login-title">CamDash</div>
-    <div class="login-sub">Enter your password to access cameras</div>
-    <div class="input-group">
-      <input id="pw-input" type="password" placeholder="Password" autocomplete="current-password"/>
-      <button class="toggle-pw" id="toggle-pw" tabindex="-1">👁</button>
-    </div>
-    <button class="login-btn" id="login-btn">Unlock Dashboard</button>
-    <div class="login-error" id="login-error"></div>
+<!-- LOGIN -->
+<div id="login" class="NEEDS_AUTH_CLASS">
+  <div class="lcard">
+    <div class="licon">📷</div>
+    <div class="ltitle">CAMDASH</div>
+    <div class="lsub">Enter password to view cameras</div>
+    <input id="pw" type="password" placeholder="Password" autocomplete="current-password"/>
+    <button id="lbtn">Unlock</button>
+    <div id="lerr"></div>
   </div>
 </div>
 
+<!-- TOPBAR -->
 <div class="topbar">
-  <div class="topbar-left">
-    <div class="logo-ring">📷</div>
-    <div>
-      <div class="topbar-title">CamDash</div>
-      <div class="topbar-sub" id="cam-count">Connecting...</div>
-    </div>
+  <div>
+    <div class="tlogo">📷 CamDash</div>
+    <div class="tsub" id="tcount">Connecting...</div>
   </div>
-  <div class="conn-pill" id="conn-pill">
-    <span class="conn-dot" id="conn-dot"></span>
-    <span id="conn-text">Connecting</span>
+  <div class="tpill" id="tpill">
+    <span class="tdot" id="tdot"></span>
+    <span id="tstat">Connecting</span>
   </div>
 </div>
 
-<div id="main-view">
-  <div id="dashboard">
-    <div class="dash-header">
-      <div class="section-label">Live Cameras</div>
-      <div class="cam-count-chip" id="cam-chip">0 online</div>
-    </div>
-    <div class="cam-grid" id="cam-grid">
-      <div class="empty-state">
-        <div class="empty-icon-box">🎥</div>
-        <h3>No cameras online</h3>
-        <p>Run <code>python main.py</code> on a laptop<br>to start streaming.</p>
-      </div>
+<!-- DASHBOARD -->
+<div id="dash">
+  <div class="dlabel">Live Cameras</div>
+  <div class="grid" id="grid">
+    <div class="empty">
+      <div class="eicon">🎥</div>
+      <p>No cameras online.<br/>Run <code>python main.py</code> on a laptop.</p>
     </div>
   </div>
 </div>
 
+<!-- FULLSCREEN VIEWER -->
 <div id="viewer">
-  <div id="viewer-feed-wrap">
-    <img id="fullscreen-feed" alt=""/>
+  <img id="vfeed" alt=""/>
+  <div id="vph"><div class="vi">🎥</div><p id="vpmsg">Waiting...</p></div>
+  <div id="vtop">
+    <button id="vback">&#8592;</button>
+    <span id="vname"></span>
+    <span id="vbadge">Connecting...</span>
   </div>
-  <div id="viewer-overlay">
-    <div class="viewer-top-grad"></div>
-    <div class="viewer-topbar">
-      <button class="back-btn" id="back-btn">&#8592;</button>
-      <span class="viewer-name" id="viewer-name"></span>
-      <span class="viewer-badge" id="viewer-badge">Connecting...</span>
-    </div>
-    <div class="viewer-ph" id="viewer-ph">
-      <div class="icon">🎥</div>
-      <p id="viewer-ph-msg">Waiting for stream...</p>
-    </div>
-    <div class="viewer-bottom-grad"></div>
-    <div class="cam-switcher" id="switcher"></div>
-  </div>
+  <div id="vsw"></div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 <script>
-  // ── State ───────────────────────────────────────────────────
-  const needsAuth  = {{ 'true' if needs_auth else 'false' }};
-  let authenticated = !needsAuth;
-  let savedPassword = ''; // FIXED: Remembers token for automatic reconnection auth
-  let cameras = {}, currentCam = null, thumbs = {};
+// ── state ──────────────────────────────────────────────────────
+var cams = {}, cur = null, thumbs = {}, authed = false, needsAuth = false;
 
-  // ── Elements ────────────────────────────────────────────────
-  const loginScreen = document.getElementById('login-screen');
-  const pwInput     = document.getElementById('pw-input');
-  const loginBtn    = document.getElementById('login-btn');
-  const loginError  = document.getElementById('login-error');
-  const togglePw    = document.getElementById('toggle-pw');
-  const connPill    = document.getElementById('conn-pill');
-  const connText    = document.getElementById('conn-text');
-  const camCount    = document.getElementById('cam-count');
-  const camChip     = document.getElementById('cam-chip');
-  const camGrid     = document.getElementById('cam-grid');
-  const viewer      = document.getElementById('viewer');
-  const overlay     = document.getElementById('viewer-overlay');
-  const viewerName  = document.getElementById('viewer-name');
-  const viewerBadge = document.getElementById('viewer-badge');
-  const viewerPh    = document.getElementById('viewer-ph');
-  const viewerPhMsg = document.getElementById('viewer-ph-msg');
-  const fsFeed      = document.getElementById('fullscreen-feed');
-  const switcher    = document.getElementById('switcher');
-  const backBtn     = document.getElementById('back-btn');
+// read needs_auth from html class
+needsAuth = document.getElementById('login').className.indexOf('hide') === -1;
+authed    = !needsAuth;
 
-  togglePw.onclick = () => {
-    pwInput.type = pwInput.type === 'password' ? 'text' : 'password';
-    togglePw.textContent = pwInput.type === 'password' ? '👁' : '🙈';
-  };
+// ── elements ───────────────────────────────────────────────────
+var loginEl = document.getElementById('login');
+var pwEl    = document.getElementById('pw');
+var lbtn    = document.getElementById('lbtn');
+var lerr    = document.getElementById('lerr');
+var tcount  = document.getElementById('tcount');
+var tpill   = document.getElementById('tpill');
+var tstat   = document.getElementById('tstat');
+var grid    = document.getElementById('grid');
+var viewer  = document.getElementById('viewer');
+var vfeed   = document.getElementById('vfeed');
+var vph     = document.getElementById('vph');
+var vpmsg   = document.getElementById('vpmsg');
+var vback   = document.getElementById('vback');
+var vname   = document.getElementById('vname');
+var vbadge  = document.getElementById('vbadge');
+var vsw     = document.getElementById('vsw');
 
-  // ── Socket ──────────────────────────────────────────────────
-  const socket = io({ transports:['websocket','polling'] });
+// ── socket ─────────────────────────────────────────────────────
+var socket = io({transports:['websocket','polling']});
 
-  socket.on('connect', () => {
-    connPill.className = 'conn-pill online';
-    connText.textContent = 'Online';
-    // FIXED: Triggers automatic silent reauth when Render recycles connections
-    if (needsAuth && savedPassword) {
-      socket.emit('authenticate', savedPassword);
-    } else if (!needsAuth) {
-      socket.emit('viewer_join');
-    }
-  });
+socket.on('connect', function(){
+  tpill.className = 'tpill on';
+  tstat.textContent = 'Online';
+  if(authed) socket.emit('viewer_join');
+});
 
-  socket.on('disconnect', () => {
-    connPill.className = 'conn-pill offline';
-    connText.textContent = 'Offline';
-    camCount.textContent = 'Disconnected';
-  });
+socket.on('disconnect', function(){
+  tpill.className = 'tpill';
+  tstat.textContent = 'Offline';
+  tcount.textContent = 'Disconnected';
+});
 
-  socket.on('auth_ok', () => {
-    authenticated = true;
-    loginScreen.classList.add('hidden');
-    socket.emit('viewer_join');
-    if (currentCam) {
-      socket.emit('viewer_watch', currentCam);
-    }
-  });
+socket.on('auth_ok', function(){
+  authed = true;
+  loginEl.className = 'hide';
+  socket.emit('viewer_join');
+});
 
-  socket.on('auth_fail', () => {
-    savedPassword = ''; // Reset on intentional bad inputs
-    pwInput.classList.add('err');
-    loginError.textContent = 'Incorrect password. Try again.';
-    loginBtn.disabled = false;
-    loginBtn.textContent = 'Unlock Dashboard';
-    setTimeout(() => pwInput.classList.remove('err'), 400);
-    pwInput.focus();
-  });
+socket.on('auth_fail', function(){
+  lerr.textContent = 'Wrong password.';
+  pwEl.className = 'shake';
+  lbtn.disabled = false;
+  lbtn.textContent = 'Unlock';
+  setTimeout(function(){ pwEl.className = ''; }, 400);
+});
 
-  socket.on('camera_list', list => {
-    cameras = {};
-    list.forEach(c => cameras[c.id] = c);
-    const n = list.length;
-    camCount.textContent = n === 0 ? 'No cameras online' : `${n} camera${n>1?'s':''} online`;
-    camChip.textContent  = `${n} online`;
-    renderDash();
-    renderSwitcher();
-    if (currentCam && !cameras[currentCam]) {
-      currentCam = null;
-      viewerBadge.className = 'viewer-badge';
-      viewerBadge.textContent = 'Offline';
-      showPh('Camera went offline');
-    }
-  });
-
-  socket.on('frame', b64 => {
-    if (!currentCam) return;
-    fsFeed.src = 'data:image/jpeg;base64,' + b64;
-    if (!fsFeed.classList.contains('visible')) {
-      fsFeed.classList.add('visible');
-      viewerPh.classList.add('hidden');
-    }
-    viewerBadge.className = 'viewer-badge live';
-    viewerBadge.textContent = '● LIVE';
-    thumbs[currentCam] = b64;
-    updateThumb(currentCam, b64);
-  });
-
-  // ── Login ───────────────────────────────────────────────────
-  function tryLogin() {
-    const pw = pwInput.value.trim();
-    if (!pw) { pwInput.focus(); return; }
-    loginBtn.disabled = true;
-    loginBtn.textContent = 'Checking...';
-    loginError.textContent = '';
-    savedPassword = pw; // FIXED: Caches password in memory to handle reconnections seamlessly
-    socket.emit('authenticate', pw);
+socket.on('camera_list', function(list){
+  cams = {};
+  for(var i=0;i<list.length;i++) cams[list[i].id] = list[i];
+  var n = list.length;
+  tcount.textContent = n ? n+' camera'+(n>1?'s':'')+' online' : 'No cameras online';
+  renderGrid();
+  renderSw();
+  if(cur && !cams[cur]){
+    cur = null;
+    vbadge.className = 'viewer-badge';
+    vbadge.textContent = 'Offline';
+    showPh('Camera went offline');
   }
-  loginBtn.onclick = tryLogin;
-  pwInput.addEventListener('keydown', e => { if (e.key === 'Enter') tryLogin(); });
+});
 
-  // ── Dashboard ────────────────────────────────────────────────
-  function renderDash() {
-    camGrid.innerHTML = '';
-    const ids = Object.keys(cameras);
-    if (!ids.length) {
-      camGrid.innerHTML = `
-        <div class="empty-state">
-          <div class="empty-icon-box">🎥</div>
-          <h3>No cameras online</h3>
-          <p>Run <code>python main.py</code> on a laptop<br>to start streaming.</p>
-        </div>`;
-      return;
-    }
-    ids.forEach((id, i) => {
-      const thumb  = thumbs[id];
-      const active = id === currentCam;
-      const d = document.createElement('div');
-      d.className = 'cam-card online' + (active ? ' streaming' : '');
-      d.id  = 'card-' + id;
-      d.style.animationDelay = (i * 0.06) + 's';
-      d.innerHTML = `
-        <div class="cam-thumb">
-          <div class="thumb-placeholder">📷</div>
-          <img id="thumb-${id}" ${thumb ? `src="data:image/jpeg;base64,${thumb}" class="loaded"` : ''} alt=""/>
-          <div class="thumb-grad"></div>
-          <div class="live-badge"><span class="live-dot"></span>LIVE</div>
-        </div>
-        <div class="cam-info">
-          <div style="min-width:0">
-            <div class="cam-name">${cameras[id].name}</div>
-            <div class="cam-sub">${active ? '▶ Streaming' : '● Online'}</div>
-          </div>
-          <div class="status-pip"></div>
-        </div>`;
-      d.onclick = () => openViewer(id);
-      camGrid.appendChild(d);
-    });
+socket.on('frame', function(b64){
+  if(!cur) return;
+  vfeed.src = 'data:image/jpeg;base64,'+b64;
+  if(!vfeed.classList.contains('show')){
+    vfeed.classList.add('show');
+    vph.className = 'hide';
   }
+  vbadge.className = 'live';
+  vbadge.textContent = '● LIVE';
+  thumbs[cur] = b64;
+  var img = document.getElementById('t'+cur);
+  if(img){ img.src='data:image/jpeg;base64,'+b64; img.className='ok'; }
+  var card = document.getElementById('c'+cur);
+  if(card) card.className = 'card online live';
+});
 
-  function updateThumb(id, b64) {
-    const img  = document.getElementById('thumb-' + id);
-    const card = document.getElementById('card-' + id);
-    if (img)  { img.src = 'data:image/jpeg;base64,' + b64; img.classList.add('loaded'); }
-    if (card) card.classList.add('streaming');
+// ── login ───────────────────────────────────────────────────────
+lbtn.onclick = doLogin;
+pwEl.onkeydown = function(e){ if(e.key==='Enter') doLogin(); };
+function doLogin(){
+  var pw = pwEl.value.trim();
+  if(!pw) return;
+  lbtn.disabled=true; lbtn.textContent='...'; lerr.textContent='';
+  socket.emit('authenticate', pw);
+}
+
+// ── grid ────────────────────────────────────────────────────────
+function renderGrid(){
+  grid.innerHTML = '';
+  var ids = Object.keys(cams);
+  if(!ids.length){
+    grid.innerHTML = '<div class="empty"><div class="eicon">🎥</div><p>No cameras online.<br/>Run <code>python main.py</code> on a laptop.</p></div>';
+    return;
   }
-
-  // ── Viewer ───────────────────────────────────────────────────
-  let hideTimer = null;
-
-  function scheduleHide() {
-    clearTimeout(hideTimer);
-    overlay.classList.remove('fade');
-    hideTimer = setTimeout(() => overlay.classList.add('fade'), 3500);
+  for(var i=0;i<ids.length;i++){
+    var id = ids[i];
+    var c  = cams[id];
+    var th = thumbs[id];
+    var isLive = (id===cur);
+    var d = document.createElement('div');
+    d.className = 'card online' + (isLive?' live':'');
+    d.id = 'c'+id;
+    d.innerHTML =
+      '<div class="thumb">'+
+        '<span>📷</span>'+
+        '<img id="t'+id+'"'+(th?' src="data:image/jpeg;base64,'+th+'" class="ok"':'')+' alt=""/>'+
+        '<div class="livebadge"><span class="rdot"></span>LIVE</div>'+
+      '</div>'+
+      '<div class="cinfo">'+
+        '<div class="cname">'+escHtml(c.name)+'</div>'+
+        '<div class="cstatus"><span class="sdot"></span>'+(isLive?'Streaming':'Online')+'</div>'+
+      '</div>';
+    d.onclick = (function(cid){ return function(){ openViewer(cid); }; })(id);
+    grid.appendChild(d);
   }
+}
 
-  function openViewer(id) {
-    if (currentCam) socket.emit('viewer_leave_cam', currentCam);
-    currentCam = id;
-    socket.emit('viewer_watch', id);
-    viewerName.textContent  = cameras[id]?.name || id;
-    viewerBadge.className   = 'viewer-badge';
-    viewerBadge.textContent = 'Connecting...';
-    if (thumbs[id]) {
-      fsFeed.src = 'data:image/jpeg;base64,' + thumbs[id];
-      fsFeed.classList.add('visible'); viewerPh.classList.add('hidden');
-    } else {
-      fsFeed.classList.remove('visible');
-      viewerPh.classList.remove('hidden');
-      viewerPhMsg.textContent = 'Waiting for stream...';
-    }
-    viewer.classList.add('open');
-    overlay.classList.remove('fade');
-    renderDash(); renderSwitcher();
-    scheduleHide();
+function escHtml(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── viewer ──────────────────────────────────────────────────────
+function openViewer(id){
+  if(cur && cur!==id) socket.emit('viewer_leave_cam', cur);
+  cur = id;
+  socket.emit('viewer_watch', id);
+  vname.textContent  = cams[id] ? cams[id].name : id;
+  vbadge.className   = '';
+  vbadge.textContent = 'Connecting...';
+  if(thumbs[id]){
+    vfeed.src = 'data:image/jpeg;base64,'+thumbs[id];
+    vfeed.classList.add('show'); vph.className='hide';
+  } else {
+    vfeed.classList.remove('show'); vph.className='';
+    vpmsg.textContent='Waiting for stream...';
   }
+  viewer.classList.add('open');
+  renderGrid(); renderSw();
+}
 
-  function closeViewer() {
-    clearTimeout(hideTimer);
-    if (currentCam) socket.emit('viewer_leave_cam', currentCam);
-    currentCam = null;
-    viewer.classList.remove('open');
-    fsFeed.classList.remove('visible');
-    overlay.classList.remove('fade');
-    renderDash();
+function closeViewer(){
+  if(cur) socket.emit('viewer_leave_cam', cur);
+  cur = null;
+  viewer.classList.remove('open');
+  vfeed.classList.remove('show');
+  renderGrid();
+}
+
+function showPh(msg){ vfeed.classList.remove('show'); vph.className=''; vpmsg.textContent=msg; }
+
+vback.onclick = function(){ closeViewer(); };
+
+// swipe down to close
+var ty=0;
+viewer.addEventListener('touchstart',function(e){ty=e.touches[0].clientY;},{passive:true});
+viewer.addEventListener('touchend',function(e){if(e.changedTouches[0].clientY-ty>80)closeViewer();},{passive:true});
+
+// ── switcher ────────────────────────────────────────────────────
+function renderSw(){
+  vsw.innerHTML='';
+  var ids=Object.keys(cams);
+  for(var i=0;i<ids.length;i++){
+    var id=ids[i];
+    var b=document.createElement('button');
+    b.className='swbtn'+(id===cur?' cur':'');
+    b.innerHTML='<span class="sd"></span>'+escHtml(cams[id].name);
+    b.onclick=(function(cid){return function(){openViewer(cid);};})(id);
+    vsw.appendChild(b);
   }
-
-  function showPh(msg) {
-    fsFeed.classList.remove('visible');
-    viewerPh.classList.remove('hidden');
-    viewerPhMsg.textContent = msg;
-  }
-
-  fsFeed.onclick = () => {
-    if (overlay.classList.contains('fade')) { scheduleHide(); }
-    else { clearTimeout(hideTimer); overlay.classList.add('fade'); }
-  };
-
-  backBtn.onclick = e => { e.stopPropagation(); closeViewer(); };
-
-  let ty = 0;
-  viewer.addEventListener('touchstart', e => { ty = e.touches[0].clientY; scheduleHide(); }, {passive:true});
-  viewer.addEventListener('touchend',   e => { if (e.changedTouches[0].clientY - ty > 90) closeViewer(); }, {passive:true});
-
-  function renderSwitcher() {
-    switcher.innerHTML = '';
-    Object.values(cameras).forEach(c => {
-      const b = document.createElement('button');
-      b.className = 'sw-btn' + (c.id === currentCam ? ' active' : '');
-      b.innerHTML = `<span class="sw-dot"></span>${c.name}`;
-      b.onclick   = e => { e.stopPropagation(); openViewer(c.id); scheduleHide(); };
-      switcher.appendChild(b);
-    });
-  }
+}
 </script>
 </body>
 </html>"""
@@ -833,14 +460,78 @@ body::before{
     # ── Flask routes ──────────────────────────────────────────────
     @app.route("/")
     def index():
-        return render_template_string(
-            VIEWER_HTML,
-            needs_auth=bool(PASSWORD_HASH)
+        # Inject needs_auth as a CSS class to avoid Jinja2/JS conflicts
+        html = VIEWER_HTML.replace(
+            'NEEDS_AUTH_CLASS',
+            '' if not PASSWORD_HASH else 'hide'
         )
+        return html
 
     @app.route("/health")
     def health():
         return "OK"
+
+    # ── Socket events ──────────────────────────────────────────
+    @sio.on("authenticate")
+    def on_authenticate(password):
+        import hashlib
+        h = hashlib.sha256(password.encode()).hexdigest()
+        if h == PASSWORD_HASH:
+            authed_sids.add(flask_request.sid)
+            emit("auth_ok")
+        else:
+            emit("auth_fail")
+
+    @sio.on("register_camera")
+    def on_register(data):
+        cam_id   = data.get("id",   flask_request.sid[:6])
+        cam_name = data.get("name", f"Camera {cam_id}")
+        cameras_by_sid[flask_request.sid] = {"id": cam_id, "name": cam_name}
+        print(f"\u2705 Online:  {cam_name}")
+        emit("camera_list", get_camera_list(), broadcast=True)
+
+    @sio.on("frame")
+    def on_frame(data):
+        cam_id = data.get("id")
+        frame  = data.get("frame")
+        if cam_id and frame:
+            emit("frame", frame, to=f"viewers_{cam_id}")
+
+    @sio.on("viewer_join")
+    def on_viewer_join():
+        if is_authed(flask_request.sid):
+            emit("camera_list", get_camera_list())
+
+    @sio.on("viewer_watch")
+    def on_viewer_watch(cam_id):
+        sid = flask_request.sid
+        if not is_authed(sid):
+            return
+        if sid in viewers_watching and viewers_watching[sid] != cam_id:
+            leave_room(f"viewers_{viewers_watching[sid]}")
+        viewers_watching[sid] = cam_id
+        join_room(f"viewers_{cam_id}")
+        print(f"\u25b6  Watching: {cam_id}")
+
+    @sio.on("viewer_leave_cam")
+    def on_viewer_leave(cam_id):
+        leave_room(f"viewers_{cam_id}")
+        if viewers_watching.get(flask_request.sid) == cam_id:
+            viewers_watching.pop(flask_request.sid, None)
+
+    @sio.on("disconnect")
+    def on_disconnect():
+        sid = flask_request.sid
+        authed_sids.discard(sid)
+        viewers_watching.pop(sid, None)
+        if sid in cameras_by_sid:
+            info = cameras_by_sid.pop(sid)
+            print(f"\u274c Offline: {info['name']}")
+            emit("camera_list", get_camera_list(), broadcast=True)
+
+    port = int(os.environ.get("PORT", 5000))
+    print(f"\U0001f680 CamDash server running on port {port}")
+    sio.run(app, host="0.0.0.0", port=port)
 
     # ── Socket events ─────────────────────────────────────────
     @sio.on("authenticate")
@@ -922,99 +613,90 @@ body::before{
 
 def run_laptop():
     try:
-        import cv2, base64, time, threading
+        import cv2, base64, time
         import socketio as sio_lib
     except ImportError:
         print('❌  pip install opencv-python "python-socketio[client]" websocket-client')
         sys.exit(1)
 
-    if "YOUR-APP-NAME" in SERVER_URL:
-        print("\n❌  Edit SERVER_URL at the top of this file first.\n")
-        sys.exit(1)
-
     cam_name = socket.gethostname()
     cam_id   = cam_name.lower().replace(" ", "_").replace("-", "_")
 
-    streaming = threading.Event()
-
     sio = sio_lib.Client(
-        reconnection=True, reconnection_attempts=0,
-        reconnection_delay=2,
+        reconnection=True, reconnection_attempts=0, reconnection_delay=2,
     )
 
     @sio.event
     def connect():
         print(f"✅ Connected as '{cam_name}'")
-        print(f"   📱 Open on phone : {SERVER_URL}")
-        print(f"   🔒 Camera is OFF  — turns on only when you tap it on the dashboard\n")
+        print(f"   📱 Dashboard : {SERVER_URL}")
+        print(f"   🎥 Streaming  — open dashboard on phone and tap this camera\n")
         sio.emit("register_camera", {"id": cam_id, "name": cam_name})
 
     @sio.event
     def disconnect():
-        streaming.clear()
         print("🔌 Disconnected — reconnecting...")
 
     @sio.event
     def connect_error(data):
         print(f"⚠️  Connection error: {data}")
 
-    @sio.on("start_stream")
-    def on_start_stream():
-        print(f"📷 Camera ON  — someone is watching '{cam_name}'")
-        streaming.set()
-
-    @sio.on("stop_stream")
-    def on_stop_stream():
-        print(f"🔒 Camera OFF — no viewers, standby")
-        streaming.clear()
-
     print(f"🔌 Connecting to {SERVER_URL} as '{cam_name}'...")
     sio.connect(SERVER_URL, transports=["websocket", "polling"])
 
-    cap = (cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-           if SYSTEM == "Windows"
-           else cv2.VideoCapture(CAMERA_INDEX))
+    # Auto-detect first working camera (internal or external)
+    cap = None
+    found_index = -1
+    print("🔍 Scanning for cameras...")
+    for idx in range(4):
+        try:
+            test = (cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                    if SYSTEM == "Windows"
+                    else cv2.VideoCapture(idx))
+            if test.isOpened():
+                ret, _ = test.read()
+                if ret:
+                    cap = test
+                    found_index = idx
+                    print(f"✅  Found camera at index {idx}")
+                    break
+                test.release()
+        except Exception:
+            pass
 
-    if not cap.isOpened():
-        if SYSTEM == "Windows":
-            cap = cv2.VideoCapture(CAMERA_INDEX)
-        if not cap.isOpened():
-            print(f"\n❌  Cannot open camera #{CAMERA_INDEX}.")
-            print("    • Close Zoom / Teams / other apps using the camera")
-            print("    • Try CAMERA_INDEX = 1 or 2")
-            sio.disconnect(); sys.exit(1)
+    if cap is None or not cap.isOpened():
+        print("\n❌  No camera found (checked indices 0-3).")
+        print("    • Make sure the camera is plugged in")
+        print("    • Close Zoom / Teams / any app using the camera")
+        print("    • Set CAMERA_INDEX manually at the top of main.py")
+        sio.disconnect(); sys.exit(1)
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS,          TARGET_FPS)
+    cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
 
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"📹 Camera ready: {w}×{h} @ {TARGET_FPS}fps  |  Ctrl+C to stop\n")
+    print(f"📹 Camera: {w}×{h} @ {TARGET_FPS}fps  |  Ctrl+C to stop\n")
 
     encode_params  = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
     frame_interval = 1.0 / TARGET_FPS
 
     try:
         while True:
-            streaming.wait()
-
-            t0  = time.monotonic()
+            t0 = time.monotonic()
             ret, frame = cap.read()
             if not ret:
                 time.sleep(0.1); continue
-
             _, buf  = cv2.imencode(".jpg", frame, encode_params)
             payload = base64.b64encode(buf).decode("ascii")
-
-            if sio.connected and streaming.is_set():
+            if sio.connected:
                 sio.emit("frame", {"id": cam_id, "frame": payload})
-
             wait = frame_interval - (time.monotonic() - t0)
             if wait > 0:
                 time.sleep(wait)
     except KeyboardInterrupt:
-        print(f"\n⏹  '{cam_name}' stopped.")
+        print(f"\n⏹  Stopped.")
     finally:
         cap.release(); sio.disconnect()
 
@@ -1040,19 +722,32 @@ def run_check():
         except ImportError:
             print(f"❌  {pkg}  →  pip install \"{pkg}\""); ok = False
 
+    # Camera scan
     try:
         import cv2
-        cap = (cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-               if SYSTEM == "Windows" else cv2.VideoCapture(CAMERA_INDEX))
-        if cap.isOpened():
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            print(f"✅  Camera #{CAMERA_INDEX} ({w}×{h})")
-            cap.release()
+        found = []
+        for idx in range(4):
+            try:
+                test = (cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                        if SYSTEM == "Windows"
+                        else cv2.VideoCapture(idx))
+                if test.isOpened():
+                    ret, _ = test.read()
+                    if ret:
+                        w = int(test.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        h = int(test.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        label = "built-in" if idx == 0 else "external"
+                        found.append((idx, w, h, label))
+                test.release()
+            except Exception:
+                pass
+        if found:
+            for idx, w, h, label in found:
+                print(f"✅  Camera #{idx} ({w}×{h}) — {label}")
         else:
-            print(f"❌  Camera #{CAMERA_INDEX} not accessible"); ok = False
+            print("❌  No cameras found"); ok = False
     except Exception as e:
-        print(f"❌  Camera error: {e}"); ok = False
+        print(f"❌  Camera scan error: {e}"); ok = False
 
     name = socket.gethostname()
     print(f"✅  Camera name: '{name}'")
@@ -1081,13 +776,17 @@ def _run_cmd(cmd, check=True):
     return r
 
 def _grant_camera_permission_macos():
+    """
+    Run a quick camera capture to trigger the macOS permission dialog.
+    Must be done once in the foreground BEFORE installing the background agent.
+    """
     print("📸 Opening camera to trigger macOS permission dialog...")
     print("   → If a popup appears, click OK / Allow.\n")
     try:
         import cv2
         cap = cv2.VideoCapture(CAMERA_INDEX)
         if cap.isOpened():
-            cap.read()   
+            cap.read()   # this line triggers the macOS permission request
             cap.release()
             print("✅  Camera permission granted — will work silently from now on.\n")
             return True
@@ -1103,6 +802,7 @@ def _grant_camera_permission_macos():
 def install_startup():
     print(f"\n⚙️  Installing auto-startup on {SYSTEM}...\n")
 
+    # ── macOS: grant camera permission FIRST, then install ──────
     if SYSTEM == "Darwin":
         _grant_camera_permission_macos()
 
@@ -1137,6 +837,7 @@ def install_startup():
         uid_r = subprocess.run(["id", "-u"], capture_output=True, text=True)
         uid   = uid_r.stdout.strip()
 
+        # Modern bootstrap (macOS 11+) with legacy load fallback
         r = _run_cmd(f"launchctl bootstrap gui/{uid} '{plist_path}'", check=False)
         if r.returncode != 0:
             r = _run_cmd(f"launchctl load -w '{plist_path}'")
@@ -1147,8 +848,9 @@ def install_startup():
         else:
             print("❌  Failed to install launchd agent.")
 
+    # ── Windows ─────────────────────────────────────────────────
     elif SYSTEM == "Windows":
-        exe = _pythonw()   
+        exe = _pythonw()   # no console window on boot
 
         xml = f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -1191,8 +893,10 @@ def install_startup():
         else:
             print("❌  Failed. Try running this script as Administrator.")
 
+        # Windows does not require a separate permission step — camera just works.
         print("\n✅  No extra permission steps needed on Windows.")
 
+    # ── Linux ────────────────────────────────────────────────────
     elif SYSTEM == "Linux":
         svc_dir  = os.path.expanduser("~/.config/systemd/user")
         svc_path = os.path.join(svc_dir, f"{SERVICE_NAME}.service")
@@ -1323,8 +1027,14 @@ def save_server_url(new_url):
 MARKER_FILE = os.path.join(SCRIPT_DIR, ".camdash_ready")
 
 def first_run_setup():
+    """
+    Runs automatically on first launch only — fully silent, no prompts.
+    Installs packages and auto-startup without asking any questions.
+    After this, future runs go straight to streaming.
+    Camera only activates when someone taps it on the phone dashboard.
+    """
     if os.path.exists(MARKER_FILE):
-        return  
+        return  # Already configured — skip silently
 
     print("""
 ╔══════════════════════════════════════════════════════╗
@@ -1332,13 +1042,16 @@ def first_run_setup():
 ╚══════════════════════════════════════════════════════╝
 """)
 
+    # ── Step 1: Install packages silently ─────────────────────
     print("  [1/2] Installing required packages...")
     auto_install_packages()
     print()
 
+    # ── Step 2: Install auto-startup silently ─────────────────
     print("  [2/2] Installing auto-startup...")
     install_startup()
 
+    # ── Mark setup as done ────────────────────────────────────
     try:
         open(MARKER_FILE, "w").write("ready")
     except Exception:
@@ -1389,5 +1102,5 @@ if __name__ == "__main__":
         else:
             print("ℹ️   Already fresh — no marker found.")
     else:
-        first_run_setup()   
+        first_run_setup()   # runs once on first launch, skipped forever after
         run_laptop()
