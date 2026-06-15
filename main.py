@@ -1,19 +1,22 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║           ALL-IN-ONE MULTI-CAMERA STREAM                     ║
+║               HYDRA — MULTI-CAMERA STREAM                    ║
 ║                                                              ║
-║  python main.py              → Stream this laptop's camera   ║
-║  python main.py --server     → Deploy this to Render         ║
-║  python main.py --install    → One-time setup + permissions  ║
+║  Just double-click main.py — setup runs automatically        ║
+║                                                              ║
+║  python main.py              → First-time setup + stream     ║
+║  python main.py --server     → Deploy to Render              ║
+║  python main.py --install    → Re-run auto-startup           ║
 ║  python main.py --uninstall  → Remove auto-start             ║
-║  python main.py --check      → Verify setup is correct       ║
+║  python main.py --check      → Verify setup                  ║
+║  python main.py --reset      → Redo first-time setup         ║
 ╚══════════════════════════════════════════════════════════════╝
 
-Requirements (laptop):
+Laptop requirements:
     pip install opencv-python "python-socketio[client]" websocket-client
 
-Requirements (server / Render):
-    pip install flask flask-socketio gevent gevent-websocket
+Server requirements (Render only):
+    pip install flask flask-socketio eventlet
 """
 
 import sys
@@ -23,21 +26,14 @@ import socket
 import subprocess
 
 # ══════════════════════════════════════════════════════════════
-#  ★  CONFIGURATION  — edit this section only
+#  ★  CONFIGURATION  — only edit this section
 # ══════════════════════════════════════════════════════════════
 
-# Your Render relay URL (set after deploying with --server)
-SERVER_URL = "https://camdash.onrender.com"
-
-# Dashboard password — viewers must enter this to see cameras.
-# Set to "" (empty string) to disable password protection.
-DASHBOARD_PASSWORD = "changeme"
-
-# Camera name is taken automatically from the computer's hostname.
-# e.g. "Johns-MacBook", "DESKTOP-AB12CD", "ubuntu-pc" — no setup needed.
+SERVER_URL         = "https://camdash.onrender.com"
+DASHBOARD_PASSWORD = "changeme"   # set "" to disable password
 
 # Camera settings
-CAMERA_INDEX  = 0     # 0 = built-in, 1/2 = external webcam
+CAMERA_INDEX  = 0     # 0 = auto-detect, ignored when auto-scan finds camera
 FRAME_WIDTH   = 1280
 FRAME_HEIGHT  = 720
 TARGET_FPS    = 20
@@ -48,57 +44,16 @@ JPEG_QUALITY  = 65    # 0-100
 SCRIPT_PATH   = os.path.abspath(__file__)
 SCRIPT_DIR    = os.path.dirname(SCRIPT_PATH)
 PYTHON_EXE    = sys.executable
-SYSTEM        = platform.system()   # "Windows" | "Darwin" | "Linux"
-SERVICE_NAME  = "camera-stream"
-SERVICE_LABEL = "com.user.camera-stream"
-
-def _pythonw():
-    """Return pythonw.exe on Windows (no console window), python elsewhere."""
-    if SYSTEM != "Windows":
-        return PYTHON_EXE
-    pw = os.path.join(os.path.dirname(PYTHON_EXE), "pythonw.exe")
-    return pw if os.path.exists(pw) else PYTHON_EXE
+SYSTEM        = platform.system()
+SERVICE_NAME  = "Hydra"
+SERVICE_LABEL = "com.user.hydra-camera"
+MARKER_FILE   = os.path.join(SCRIPT_DIR, ".camdash_ready")
 
 # ─────────────────────────────────────────────────────────────
-#  SERVER MODE  (deploy on Render)
+#  DASHBOARD HTML  (served to phone browser)
 # ─────────────────────────────────────────────────────────────
 
-def run_server():
-    try:
-        import eventlet
-        eventlet.monkey_patch()
-        from flask import Flask, render_template_string, request as flask_request
-        from flask_socketio import SocketIO, emit, join_room, leave_room
-    except ImportError:
-        print("❌  pip install flask flask-socketio eventlet")
-        sys.exit(1)
-
-    import hashlib
-    PASSWORD_HASH = (
-        hashlib.sha256(DASHBOARD_PASSWORD.encode()).hexdigest()
-        if DASHBOARD_PASSWORD else ""
-    )
-
-    app = Flask(__name__)
-    app.config["SECRET_KEY"] = "multi-cam-2024"
-    sio = SocketIO(
-        app, cors_allowed_origins="*",
-        max_http_buffer_size=10 * 1024 * 1024,
-        async_mode="eventlet", ping_timeout=60, ping_interval=25,
-    )
-
-    cameras_by_sid   = {}   # sid → {id, name}
-    authed_sids      = set() # authenticated viewer sids
-    viewers_watching = {}   # viewer sid → cam_id being watched
-
-    def get_camera_list():
-        return [{"id": v["id"], "name": v["name"]} for v in cameras_by_sid.values()]
-
-    def is_authed(sid):
-        return (not PASSWORD_HASH) or (sid in authed_sids)
-
-    # ── Phone Dashboard HTML ──────────────────────────────────
-    VIEWER_HTML = """<!DOCTYPE html>
+VIEWER_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -184,8 +139,6 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 /* ── FULLSCREEN VIEWER ── */
 #viewer{display:none;position:fixed;inset:0;z-index:100;background:#000;flex-direction:column}
 #viewer.open{display:flex}
-
-/* viewer top bar — standalone, no overlay parent */
 #vtop{position:absolute;top:0;left:0;right:0;z-index:10;
   background:linear-gradient(to bottom,rgba(0,0,0,.8),transparent);
   padding:env(safe-area-inset-top,16px) 16px 32px;
@@ -199,16 +152,12 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
   background:rgba(0,0,0,.5);color:rgba(255,255,255,.5);
   border:1px solid rgba(255,255,255,.12);white-space:nowrap}
 #vbadge.live{background:rgba(248,113,113,.2);color:var(--red);border-color:rgba(248,113,113,.4)}
-
-/* feed */
 #vfeed{position:absolute;inset:0;display:none;width:100%;height:100%;object-fit:contain}
 #vfeed.show{display:block}
 #vph{position:absolute;inset:0;z-index:5;display:flex;flex-direction:column;
   align-items:center;justify-content:center;gap:12px;color:rgba(255,255,255,.2)}
 #vph .vi{font-size:3rem;opacity:.3}
 #vph.hide{display:none}
-
-/* viewer bottom switcher — standalone, no overlay parent */
 #vsw{position:absolute;bottom:0;left:0;right:0;z-index:10;
   background:linear-gradient(to top,rgba(0,0,0,.85),transparent);
   padding:32px 16px env(safe-area-inset-bottom,16px);
@@ -244,7 +193,7 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
     <div class="tsub" id="tcount">Connecting...</div>
   </div>
   <div class="tpill" id="tpill">
-    <span class="tdot" id="tdot"></span>
+    <span class="tdot"></span>
     <span id="tstat">Connecting</span>
   </div>
 </div>
@@ -274,146 +223,112 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 <script>
-// ── state ──────────────────────────────────────────────────────
-var cams = {}, cur = null, thumbs = {}, authed = false, needsAuth = false;
-
-// read needs_auth from html class
+var cams={}, cur=null, thumbs={}, authed=false, needsAuth=false;
 needsAuth = document.getElementById('login').className.indexOf('hide') === -1;
 authed    = !needsAuth;
 
-// ── elements ───────────────────────────────────────────────────
-var loginEl = document.getElementById('login');
-var pwEl    = document.getElementById('pw');
-var lbtn    = document.getElementById('lbtn');
-var lerr    = document.getElementById('lerr');
-var tcount  = document.getElementById('tcount');
-var tpill   = document.getElementById('tpill');
-var tstat   = document.getElementById('tstat');
-var grid    = document.getElementById('grid');
-var viewer  = document.getElementById('viewer');
-var vfeed   = document.getElementById('vfeed');
-var vph     = document.getElementById('vph');
-var vpmsg   = document.getElementById('vpmsg');
-var vback   = document.getElementById('vback');
-var vname   = document.getElementById('vname');
-var vbadge  = document.getElementById('vbadge');
-var vsw     = document.getElementById('vsw');
+var loginEl=document.getElementById('login');
+var pwEl=document.getElementById('pw');
+var lbtn=document.getElementById('lbtn');
+var lerr=document.getElementById('lerr');
+var tcount=document.getElementById('tcount');
+var tpill=document.getElementById('tpill');
+var tstat=document.getElementById('tstat');
+var grid=document.getElementById('grid');
+var viewer=document.getElementById('viewer');
+var vfeed=document.getElementById('vfeed');
+var vph=document.getElementById('vph');
+var vpmsg=document.getElementById('vpmsg');
+var vback=document.getElementById('vback');
+var vname=document.getElementById('vname');
+var vbadge=document.getElementById('vbadge');
+var vsw=document.getElementById('vsw');
 
-// ── socket ─────────────────────────────────────────────────────
-var socket = io({transports:['websocket','polling']});
+var socket=io({transports:['websocket','polling']});
 
-socket.on('connect', function(){
-  tpill.className = 'tpill on';
-  tstat.textContent = 'Online';
+socket.on('connect',function(){
+  tpill.className='tpill on'; tstat.textContent='Online';
   if(authed) socket.emit('viewer_join');
 });
-
-socket.on('disconnect', function(){
-  tpill.className = 'tpill';
-  tstat.textContent = 'Offline';
-  tcount.textContent = 'Disconnected';
+socket.on('disconnect',function(){
+  tpill.className='tpill'; tstat.textContent='Offline';
+  tcount.textContent='Disconnected';
 });
-
-socket.on('auth_ok', function(){
-  authed = true;
-  loginEl.className = 'hide';
+socket.on('auth_ok',function(){
+  authed=true; loginEl.className='hide';
   socket.emit('viewer_join');
 });
-
-socket.on('auth_fail', function(){
-  lerr.textContent = 'Wrong password.';
-  pwEl.className = 'shake';
-  lbtn.disabled = false;
-  lbtn.textContent = 'Unlock';
-  setTimeout(function(){ pwEl.className = ''; }, 400);
+socket.on('auth_fail',function(){
+  lerr.textContent='Wrong password.';
+  pwEl.className='shake'; lbtn.disabled=false; lbtn.textContent='Unlock';
+  setTimeout(function(){pwEl.className='';},400);
 });
-
-socket.on('camera_list', function(list){
-  cams = {};
-  for(var i=0;i<list.length;i++) cams[list[i].id] = list[i];
-  var n = list.length;
-  tcount.textContent = n ? n+' camera'+(n>1?'s':'')+' online' : 'No cameras online';
-  renderGrid();
-  renderSw();
-  if(cur && !cams[cur]){
-    cur = null;
-    vbadge.className = 'viewer-badge';
-    vbadge.textContent = 'Offline';
+socket.on('camera_list',function(list){
+  cams={};
+  for(var i=0;i<list.length;i++) cams[list[i].id]=list[i];
+  var n=list.length;
+  tcount.textContent=n?n+' camera'+(n>1?'s':'')+' online':'No cameras online';
+  renderGrid(); renderSw();
+  if(cur&&!cams[cur]){
+    cur=null; vbadge.className=''; vbadge.textContent='Offline';
     showPh('Camera went offline');
   }
 });
-
-socket.on('frame', function(b64){
+socket.on('frame',function(b64){
   if(!cur) return;
-  vfeed.src = 'data:image/jpeg;base64,'+b64;
+  vfeed.src='data:image/jpeg;base64,'+b64;
   if(!vfeed.classList.contains('show')){
-    vfeed.classList.add('show');
-    vph.className = 'hide';
+    vfeed.classList.add('show'); vph.className='hide';
   }
-  vbadge.className = 'live';
-  vbadge.textContent = '● LIVE';
-  thumbs[cur] = b64;
-  var img = document.getElementById('t'+cur);
-  if(img){ img.src='data:image/jpeg;base64,'+b64; img.className='ok'; }
-  var card = document.getElementById('c'+cur);
-  if(card) card.className = 'card online live';
+  vbadge.className='live'; vbadge.textContent='● LIVE';
+  thumbs[cur]=b64;
+  var img=document.getElementById('t'+cur);
+  if(img){img.src='data:image/jpeg;base64,'+b64; img.className='ok';}
+  var card=document.getElementById('c'+cur);
+  if(card) card.className='card online live';
 });
 
-// ── login ───────────────────────────────────────────────────────
-lbtn.onclick = doLogin;
-pwEl.onkeydown = function(e){ if(e.key==='Enter') doLogin(); };
+lbtn.onclick=doLogin;
+pwEl.onkeydown=function(e){if(e.key==='Enter') doLogin();};
 function doLogin(){
-  var pw = pwEl.value.trim();
-  if(!pw) return;
+  var pw=pwEl.value.trim(); if(!pw) return;
   lbtn.disabled=true; lbtn.textContent='...'; lerr.textContent='';
-  socket.emit('authenticate', pw);
+  socket.emit('authenticate',pw);
 }
 
-// ── grid ────────────────────────────────────────────────────────
+function esc(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
 function renderGrid(){
-  grid.innerHTML = '';
-  var ids = Object.keys(cams);
+  grid.innerHTML='';
+  var ids=Object.keys(cams);
   if(!ids.length){
-    grid.innerHTML = '<div class="empty"><div class="eicon">🎥</div><p>No cameras online.<br/>Run <code>python main.py</code> on a laptop.</p></div>';
+    grid.innerHTML='<div class="empty"><div class="eicon">🎥</div><p>No cameras online.<br/>Run <code>python main.py</code> on a laptop.</p></div>';
     return;
   }
   for(var i=0;i<ids.length;i++){
-    var id = ids[i];
-    var c  = cams[id];
-    var th = thumbs[id];
-    var isLive = (id===cur);
-    var d = document.createElement('div');
-    d.className = 'card online' + (isLive?' live':'');
-    d.id = 'c'+id;
-    d.innerHTML =
-      '<div class="thumb">'+
-        '<span>📷</span>'+
-        '<img id="t'+id+'"'+(th?' src="data:image/jpeg;base64,'+th+'" class="ok"':'')+' alt=""/>'+
-        '<div class="livebadge"><span class="rdot"></span>LIVE</div>'+
-      '</div>'+
-      '<div class="cinfo">'+
-        '<div class="cname">'+escHtml(c.name)+'</div>'+
-        '<div class="cstatus"><span class="sdot"></span>'+(isLive?'Streaming':'Online')+'</div>'+
-      '</div>';
-    d.onclick = (function(cid){ return function(){ openViewer(cid); }; })(id);
+    var id=ids[i], c=cams[id], th=thumbs[id], isLive=(id===cur);
+    var d=document.createElement('div');
+    d.className='card online'+(isLive?' live':''); d.id='c'+id;
+    d.innerHTML=
+      '<div class="thumb"><span>📷</span>'+
+      '<img id="t'+id+'"'+(th?' src="data:image/jpeg;base64,'+th+'" class="ok"':'')+' alt=""/>'+
+      '<div class="livebadge"><span class="rdot"></span>LIVE</div></div>'+
+      '<div class="cinfo"><div class="cname">'+esc(c.name)+'</div>'+
+      '<div class="cstatus"><span class="sdot"></span>'+(isLive?'Streaming':'Online')+'</div></div>';
+    d.onclick=(function(cid){return function(){openViewer(cid);};})(id);
     grid.appendChild(d);
   }
 }
 
-function escHtml(s){
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-// ── viewer ──────────────────────────────────────────────────────
 function openViewer(id){
-  if(cur && cur!==id) socket.emit('viewer_leave_cam', cur);
-  cur = id;
-  socket.emit('viewer_watch', id);
-  vname.textContent  = cams[id] ? cams[id].name : id;
-  vbadge.className   = '';
-  vbadge.textContent = 'Connecting...';
+  if(cur&&cur!==id) socket.emit('viewer_leave_cam',cur);
+  cur=id; socket.emit('viewer_watch',id);
+  vname.textContent=cams[id]?cams[id].name:id;
+  vbadge.className=''; vbadge.textContent='Connecting...';
   if(thumbs[id]){
-    vfeed.src = 'data:image/jpeg;base64,'+thumbs[id];
+    vfeed.src='data:image/jpeg;base64,'+thumbs[id];
     vfeed.classList.add('show'); vph.className='hide';
   } else {
     vfeed.classList.remove('show'); vph.className='';
@@ -424,31 +339,30 @@ function openViewer(id){
 }
 
 function closeViewer(){
-  if(cur) socket.emit('viewer_leave_cam', cur);
-  cur = null;
-  viewer.classList.remove('open');
-  vfeed.classList.remove('show');
-  renderGrid();
+  if(cur) socket.emit('viewer_leave_cam',cur);
+  cur=null; viewer.classList.remove('open');
+  vfeed.classList.remove('show'); renderGrid();
 }
 
-function showPh(msg){ vfeed.classList.remove('show'); vph.className=''; vpmsg.textContent=msg; }
+function showPh(msg){
+  vfeed.classList.remove('show'); vph.className=''; vpmsg.textContent=msg;
+}
 
-vback.onclick = function(){ closeViewer(); };
+vback.onclick=function(){closeViewer();};
 
-// swipe down to close
 var ty=0;
 viewer.addEventListener('touchstart',function(e){ty=e.touches[0].clientY;},{passive:true});
-viewer.addEventListener('touchend',function(e){if(e.changedTouches[0].clientY-ty>80)closeViewer();},{passive:true});
+viewer.addEventListener('touchend',function(e){
+  if(e.changedTouches[0].clientY-ty>80) closeViewer();
+},{passive:true});
 
-// ── switcher ────────────────────────────────────────────────────
 function renderSw(){
   vsw.innerHTML='';
   var ids=Object.keys(cams);
   for(var i=0;i<ids.length;i++){
-    var id=ids[i];
-    var b=document.createElement('button');
+    var id=ids[i], b=document.createElement('button');
     b.className='swbtn'+(id===cur?' cur':'');
-    b.innerHTML='<span class="sd"></span>'+escHtml(cams[id].name);
+    b.innerHTML='<span class="sd"></span>'+esc(cams[id].name);
     b.onclick=(function(cid){return function(){openViewer(cid);};})(id);
     vsw.appendChild(b);
   }
@@ -457,25 +371,59 @@ function renderSw(){
 </body>
 </html>"""
 
-    # ── Flask routes ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+#  SERVER MODE  (deploy on Render)
+# ─────────────────────────────────────────────────────────────
+
+def run_server():
+    try:
+        import eventlet
+        eventlet.monkey_patch()
+        from flask import Flask, request as flask_request
+        from flask_socketio import SocketIO, emit, join_room, leave_room
+    except ImportError:
+        print("❌  pip install flask flask-socketio eventlet")
+        sys.exit(1)
+
+    import hashlib
+    PASSWORD_HASH = (
+        hashlib.sha256(DASHBOARD_PASSWORD.encode()).hexdigest()
+        if DASHBOARD_PASSWORD else ""
+    )
+
+    app = Flask(__name__)
+    app.config["SECRET_KEY"] = "hydra-cam-2024"
+    sio = SocketIO(
+        app, cors_allowed_origins="*",
+        max_http_buffer_size=10 * 1024 * 1024,
+        async_mode="eventlet", ping_timeout=60, ping_interval=25,
+    )
+
+    cameras_by_sid   = {}   # sid → {id, name}
+    authed_sids      = set()
+    viewers_watching = {}   # viewer sid → cam_id
+
+    def get_camera_list():
+        return [{"id": v["id"], "name": v["name"]} for v in cameras_by_sid.values()]
+
+    def is_authed(sid):
+        return (not PASSWORD_HASH) or (sid in authed_sids)
+
     @app.route("/")
     def index():
-        # Inject needs_auth as a CSS class to avoid Jinja2/JS conflicts
-        html = VIEWER_HTML.replace(
-            'NEEDS_AUTH_CLASS',
-            '' if not PASSWORD_HASH else 'hide'
+        return VIEWER_HTML.replace(
+            "NEEDS_AUTH_CLASS",
+            "" if not PASSWORD_HASH else "hide"
         )
-        return html
 
     @app.route("/health")
     def health():
         return "OK"
 
-    # ── Socket events ──────────────────────────────────────────
     @sio.on("authenticate")
     def on_authenticate(password):
-        import hashlib
-        h = hashlib.sha256(password.encode()).hexdigest()
+        import hashlib as _hl
+        h = _hl.sha256(password.encode()).hexdigest()
         if h == PASSWORD_HASH:
             authed_sids.add(flask_request.sid)
             emit("auth_ok")
@@ -487,7 +435,7 @@ function renderSw(){
         cam_id   = data.get("id",   flask_request.sid[:6])
         cam_name = data.get("name", f"Camera {cam_id}")
         cameras_by_sid[flask_request.sid] = {"id": cam_id, "name": cam_name}
-        print(f"\u2705 Online:  {cam_name}")
+        print(f"📹 Online:  {cam_name}")
         emit("camera_list", get_camera_list(), broadcast=True)
 
     @sio.on("frame")
@@ -507,11 +455,12 @@ function renderSw(){
         sid = flask_request.sid
         if not is_authed(sid):
             return
-        if sid in viewers_watching and viewers_watching[sid] != cam_id:
-            leave_room(f"viewers_{viewers_watching[sid]}")
+        old = viewers_watching.get(sid)
+        if old and old != cam_id:
+            leave_room(f"viewers_{old}")
         viewers_watching[sid] = cam_id
         join_room(f"viewers_{cam_id}")
-        print(f"\u25b6  Watching: {cam_id}")
+        print(f"▶  Watching: {cam_id}")
 
     @sio.on("viewer_leave_cam")
     def on_viewer_leave(cam_id):
@@ -526,84 +475,11 @@ function renderSw(){
         viewers_watching.pop(sid, None)
         if sid in cameras_by_sid:
             info = cameras_by_sid.pop(sid)
-            print(f"\u274c Offline: {info['name']}")
+            print(f"📴 Offline: {info['name']}")
             emit("camera_list", get_camera_list(), broadcast=True)
 
     port = int(os.environ.get("PORT", 5000))
-    print(f"\U0001f680 CamDash server running on port {port}")
-    sio.run(app, host="0.0.0.0", port=port)
-
-    # ── Socket events ─────────────────────────────────────────
-    @sio.on("authenticate")
-    def on_authenticate(password):
-        import hashlib
-        h = hashlib.sha256(password.encode()).hexdigest()
-        if h == PASSWORD_HASH:
-            authed_sids.add(flask_request.sid)
-            sio.emit("auth_ok",   to=flask_request.sid)
-        else:
-            sio.emit("auth_fail", to=flask_request.sid)
-
-    @sio.on("register_camera")
-    def on_register(data):
-        cam_id   = data.get("id",   flask_request.sid[:6])
-        cam_name = data.get("name", f"Camera {cam_id}")
-        cameras_by_sid[flask_request.sid] = {"id": cam_id, "name": cam_name}
-        cam_id_to_sid[cam_id] = flask_request.sid
-        print(f"📹 Online:  {cam_name}")
-        sio.emit("camera_list", get_camera_list())   # notify all viewers
-
-    @sio.on("frame")
-    def on_frame(data):
-        cam_id = data.get("id")
-        frame  = data.get("frame")
-        if cam_id and frame:
-            sio.emit("frame", frame, to=f"viewers_{cam_id}")
-
-    @sio.on("viewer_join")
-    def on_viewer_join():
-        if is_authed(flask_request.sid):
-            sio.emit("camera_list", get_camera_list(), to=flask_request.sid)
-
-    @sio.on("viewer_watch")
-    def on_viewer_watch(cam_id):
-        sid = flask_request.sid
-        if not is_authed(sid):
-            return
-        if sid in viewers_watching:
-            old = viewers_watching[sid]
-            if old != cam_id:
-                leave_room(f"viewers_{old}")
-                viewer_stop(old)
-        viewers_watching[sid] = cam_id
-        join_room(f"viewers_{cam_id}")
-        viewer_start(cam_id)
-
-    @sio.on("viewer_leave_cam")
-    def on_viewer_leave(cam_id):
-        sid = flask_request.sid
-        leave_room(f"viewers_{cam_id}")
-        if viewers_watching.get(sid) == cam_id:
-            viewers_watching.pop(sid, None)
-            viewer_stop(cam_id)
-
-    @sio.on("disconnect")
-    def on_disconnect():
-        sid = flask_request.sid
-        authed_sids.discard(sid)
-        if sid in viewers_watching:
-            cam_id = viewers_watching.pop(sid)
-            leave_room(f"viewers_{cam_id}")
-            viewer_stop(cam_id)
-        if sid in cameras_by_sid:
-            info = cameras_by_sid.pop(sid)
-            cam_id_to_sid.pop(info["id"], None)
-            viewer_counts.pop(info["id"], None)
-            print(f"📴 Offline: {info['name']}")
-            sio.emit("camera_list", get_camera_list())
-
-    port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Multi-camera relay server on port {port}")
+    print(f"🚀 Hydra server running on port {port}")
     sio.run(app, host="0.0.0.0", port=port)
 
 
@@ -613,7 +489,7 @@ function renderSw(){
 
 def run_laptop():
     try:
-        import cv2, base64, time
+        import cv2, base64, time, threading
         import socketio as sio_lib
     except ImportError:
         print('❌  pip install opencv-python "python-socketio[client]" websocket-client')
@@ -630,12 +506,12 @@ def run_laptop():
     def connect():
         print(f"✅ Connected as '{cam_name}'")
         print(f"   📱 Dashboard : {SERVER_URL}")
-        print(f"   🎥 Streaming  — open dashboard on phone and tap this camera\n")
+        print(f"   🎥 Open dashboard on phone and tap this camera\n")
         sio.emit("register_camera", {"id": cam_id, "name": cam_name})
 
     @sio.event
     def disconnect():
-        print("🔌 Disconnected — reconnecting...")
+        print("🔌 Disconnected — reconnecting automatically...")
 
     @sio.event
     def connect_error(data):
@@ -644,23 +520,33 @@ def run_laptop():
     print(f"🔌 Connecting to {SERVER_URL} as '{cam_name}'...")
     sio.connect(SERVER_URL, transports=["websocket", "polling"])
 
-    # Auto-detect first working camera (internal or external)
+    # ── Auto-detect first working camera ─────────────────────
     cap = None
     found_index = -1
+
+    # Windows: disable MSMF (buggy) and force DirectShow
+    if SYSTEM == "Windows":
+        os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
+
     print("🔍 Scanning for cameras...")
     for idx in range(4):
         try:
-            test = (cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                    if SYSTEM == "Windows"
-                    else cv2.VideoCapture(idx))
-            if test.isOpened():
-                ret, _ = test.read()
-                if ret:
-                    cap = test
-                    found_index = idx
-                    print(f"✅  Found camera at index {idx}")
-                    break
-                test.release()
+            if SYSTEM == "Windows":
+                test = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            else:
+                test = cv2.VideoCapture(idx)
+            if not test.isOpened():
+                test.release(); continue
+            # Read a few frames to wake up the camera
+            for _ in range(5):
+                test.read()
+            ret, frame = test.read()
+            if ret and frame is not None and frame.size > 0:
+                cap = test
+                found_index = idx
+                print(f"✅  Camera found at index {idx}")
+                break
+            test.release()
         except Exception:
             pass
 
@@ -668,26 +554,48 @@ def run_laptop():
         print("\n❌  No camera found (checked indices 0-3).")
         print("    • Make sure the camera is plugged in")
         print("    • Close Zoom / Teams / any app using the camera")
-        print("    • Set CAMERA_INDEX manually at the top of main.py")
         sio.disconnect(); sys.exit(1)
 
+    # ── Set resolution and warm up ────────────────────────────
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+    cap.set(cv2.CAP_PROP_FPS,          TARGET_FPS)
+
+    # Warmup: discard frames while auto-exposure settles (avoids blue frames)
+    print("⏳ Warming up camera...")
+    for _ in range(30):
+        cap.read()
 
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"📹 Camera: {w}×{h} @ {TARGET_FPS}fps  |  Ctrl+C to stop\n")
+    print(f"✅ Camera #{found_index}: {w}×{h} @ {TARGET_FPS}fps — streaming now\n")
 
     encode_params  = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
     frame_interval = 1.0 / TARGET_FPS
+
+    # Keepalive: prevents Render free tier from sleeping
+    def _keepalive():
+        while True:
+            time.sleep(20)
+            try:
+                if sio.connected:
+                    sio.emit("ping_keepalive", {})
+            except Exception:
+                pass
+
+    threading.Thread(target=_keepalive, daemon=True).start()
 
     try:
         while True:
             t0 = time.monotonic()
             ret, frame = cap.read()
-            if not ret:
+            if not ret or frame is None:
                 time.sleep(0.1); continue
+
+            # Skip frames with near-zero brightness (camera not ready yet)
+            if cv2.mean(frame)[0] < 5:
+                time.sleep(0.05); continue
+
             _, buf  = cv2.imencode(".jpg", frame, encode_params)
             payload = base64.b64encode(buf).decode("ascii")
             if sio.connected:
@@ -709,28 +617,33 @@ def run_check():
     print("\n🔍 Checking setup...\n")
     ok = True
 
+    # Server URL
     if "YOUR-APP-NAME" in SERVER_URL:
         print("❌  SERVER_URL not set"); ok = False
     else:
         print(f"✅  SERVER_URL: {SERVER_URL}")
 
-    for pkg, mod in [("opencv-python","cv2"),
-                     ("python-socketio[client]","socketio"),
-                     ("websocket-client","websocket")]:
+    # Packages
+    for pkg, mod in [("opencv-python",          "cv2"),
+                     ("python-socketio[client]", "socketio"),
+                     ("websocket-client",        "websocket")]:
         try:
             __import__(mod); print(f"✅  {pkg}")
         except ImportError:
-            print(f"❌  {pkg}  →  pip install \"{pkg}\""); ok = False
+            print(f"❌  {pkg} not installed  →  pip install \"{pkg}\""); ok = False
 
-    # Camera scan
+    # Camera scan (uses DirectShow on Windows — avoids MSMF errors)
     try:
         import cv2
+        if SYSTEM == "Windows":
+            os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
         found = []
         for idx in range(4):
             try:
-                test = (cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                        if SYSTEM == "Windows"
-                        else cv2.VideoCapture(idx))
+                if SYSTEM == "Windows":
+                    test = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                else:
+                    test = cv2.VideoCapture(idx)
                 if test.isOpened():
                     ret, _ = test.read()
                     if ret:
@@ -749,20 +662,52 @@ def run_check():
     except Exception as e:
         print(f"❌  Camera scan error: {e}"); ok = False
 
-    name = socket.gethostname()
-    print(f"✅  Camera name: '{name}'")
-
+    # Name + password
+    print(f"✅  Camera name: '{socket.gethostname()}'")
     if DASHBOARD_PASSWORD:
         print(f"✅  Password protection: ON")
     else:
-        print(f"⚠️  Password protection: OFF (set DASHBOARD_PASSWORD to secure your feed)")
+        print(f"⚠️  Password protection: OFF")
 
-    if SYSTEM == "Windows":
-        pw = _pythonw()
-        label = "✅" if "pythonw" in pw else "⚠️ "
-        print(f"{label}  pythonw.exe: {pw}")
+    print(f"\n{'✅  All good!' if ok else '⚠️  Fix issues above first.'}\n")
 
-    print(f"\n{'✅  All good! Run: python main.py' if ok else '⚠️  Fix issues above first.'}\n")
+
+# ─────────────────────────────────────────────────────────────
+#  WINDOWS SERVICE CLASS  (visible in Task Manager → Services)
+# ─────────────────────────────────────────────────────────────
+
+if SYSTEM == "Windows":
+    try:
+        import win32serviceutil as _wsutil
+        import win32service    as _winsvc
+        import win32event      as _wevt
+        import servicemanager  as _smgr
+
+        class HydraService(_wsutil.ServiceFramework):
+            _svc_name_         = "Hydra"
+            _svc_display_name_ = "Hydra Camera Stream"
+            _svc_description_  = "diri ak maaram"
+
+            def __init__(self, args):
+                _wsutil.ServiceFramework.__init__(self, args)
+                self._stop = _wevt.CreateEvent(None, 0, 0, None)
+
+            def SvcStop(self):
+                self.ReportServiceStatus(_winsvc.SERVICE_STOP_PENDING)
+                _wevt.SetEvent(self._stop)
+
+            def SvcDoRun(self):
+                import threading
+                _smgr.LogMsg(
+                    _smgr.EVENTLOG_INFORMATION_TYPE,
+                    _smgr.PYS_SERVICE_STARTED,
+                    (self._svc_name_, ""))
+                t = threading.Thread(target=run_laptop, daemon=True)
+                t.start()
+                _wevt.WaitForSingleObject(self._stop, _wevt.INFINITE)
+
+    except ImportError:
+        HydraService = None   # pywin32 not installed yet
 
 
 # ─────────────────────────────────────────────────────────────
@@ -776,47 +721,40 @@ def _run_cmd(cmd, check=True):
     return r
 
 def _grant_camera_permission_macos():
-    """
-    Run a quick camera capture to trigger the macOS permission dialog.
-    Must be done once in the foreground BEFORE installing the background agent.
-    """
+    """Trigger macOS camera permission dialog once."""
     print("📸 Opening camera to trigger macOS permission dialog...")
-    print("   → If a popup appears, click OK / Allow.\n")
+    print("   If a popup appears — click OK / Allow.\n")
     try:
         import cv2
-        cap = cv2.VideoCapture(CAMERA_INDEX)
+        cap = cv2.VideoCapture(0)
         if cap.isOpened():
-            cap.read()   # this line triggers the macOS permission request
+            cap.read()
             cap.release()
-            print("✅  Camera permission granted — will work silently from now on.\n")
+            print("✅  Camera permission granted.\n")
             return True
         else:
             print("⚠️  Camera did not open.")
-            print("   → Go to: System Settings → Privacy & Security → Camera")
-            print(f"   → Enable access for Python ({PYTHON_EXE})\n")
+            print(f"   Go to: System Settings → Privacy & Security → Camera → Python ✓\n")
             return False
     except ImportError:
         print("❌  opencv-python not installed. Run:  pip install opencv-python")
         return False
 
 def install_startup():
-    print(f"\n⚙️  Installing auto-startup on {SYSTEM}...\n")
+    print(f"\n⚙️  Installing Hydra service on {SYSTEM}...\n")
 
-    # ── macOS: grant camera permission FIRST, then install ──────
+    # ── macOS ─────────────────────────────────────────────────
     if SYSTEM == "Darwin":
         _grant_camera_permission_macos()
-
-        import getpass
         plist_dir  = os.path.expanduser("~/Library/LaunchAgents")
         plist_path = os.path.join(plist_dir, f"{SERVICE_LABEL}.plist")
-        log_path   = os.path.join(SCRIPT_DIR, "camera_stream.log")
+        log_path   = os.path.join(SCRIPT_DIR, "hydra.log")
         os.makedirs(plist_dir, exist_ok=True)
 
         plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
+<plist version="1.0"><dict>
     <key>Label</key>             <string>{SERVICE_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
@@ -828,83 +766,82 @@ def install_startup():
     <key>KeepAlive</key>         <true/>
     <key>StandardOutPath</key>   <string>{log_path}</string>
     <key>StandardErrorPath</key> <string>{log_path}</string>
-</dict>
-</plist>"""
+</dict></plist>"""
 
         with open(plist_path, "w") as f:
             f.write(plist)
 
-        uid_r = subprocess.run(["id", "-u"], capture_output=True, text=True)
-        uid   = uid_r.stdout.strip()
-
-        # Modern bootstrap (macOS 11+) with legacy load fallback
+        uid = subprocess.run(["id", "-u"], capture_output=True, text=True).stdout.strip()
         r = _run_cmd(f"launchctl bootstrap gui/{uid} '{plist_path}'", check=False)
         if r.returncode != 0:
             r = _run_cmd(f"launchctl load -w '{plist_path}'")
 
         if r.returncode == 0:
-            print(f"✅  launchd agent installed — starts automatically on every login.")
+            print(f"✅  Hydra installed — starts on every login.")
             print(f"ℹ️   Logs: tail -f {log_path}")
         else:
             print("❌  Failed to install launchd agent.")
 
-    # ── Windows ─────────────────────────────────────────────────
+    # ── Windows ───────────────────────────────────────────────
     elif SYSTEM == "Windows":
-        exe = _pythonw()   # no console window on boot
+        print("  Installing Hydra as a Windows Service...\n")
+        global HydraService
 
-        xml = f"""<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
-  <Settings>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <Hidden>true</Hidden>
-  </Settings>
-  <Principals>
-    <Principal>
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
-    </Principal>
-  </Principals>
-  <Actions>
-    <Exec>
-      <Command>{exe}</Command>
-      <Arguments>"{SCRIPT_PATH}"</Arguments>
-      <WorkingDirectory>{SCRIPT_DIR}</WorkingDirectory>
-    </Exec>
-  </Actions>
-</Task>"""
+        # Install pywin32 if missing
+        if HydraService is None:
+            print("  📦 Installing pywin32...")
+            r = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "pywin32", "-q"],
+                capture_output=True, text=True
+            )
+            if r.returncode != 0:
+                print("  ❌ pip install failed — try running as Administrator")
+                return
+            scripts = os.path.join(os.path.dirname(sys.executable), "Scripts")
+            hook    = os.path.join(scripts, "pywin32_postinstall.py")
+            if os.path.exists(hook):
+                subprocess.run([sys.executable, hook, "-install"],
+                               capture_output=True)
+            print("  ✅ pywin32 installed.")
+            print("  🔄 Restarting to apply — please double-click main.py again.")
+            # Relaunch so HydraService class gets defined
+            subprocess.Popen([sys.executable, SCRIPT_PATH, "--install"])
+            sys.exit(0)
 
-        xml_path = os.path.join(SCRIPT_DIR, "_task.xml")
-        with open(xml_path, "w", encoding="utf-16") as f:
-            f.write(xml)
-        _run_cmd(f'schtasks /Delete /TN "{SERVICE_NAME}" /F', check=False)
-        r = _run_cmd(f'schtasks /Create /TN "{SERVICE_NAME}" /XML "{xml_path}" /F')
-        os.remove(xml_path)
+        # Remove old service if exists
+        try:
+            import win32serviceutil
+            import win32service
+            for action in ("StopService", "RemoveService"):
+                try: getattr(win32serviceutil, action)("Hydra")
+                except Exception: pass
 
-        if r.returncode == 0:
-            print(f"✅  Task Scheduler entry created: '{SERVICE_NAME}'")
-            print(f"ℹ️   Starts silently on every login — no console window.")
-            print(f"ℹ️   Start now without rebooting:")
-            print(f'    schtasks /Run /TN "{SERVICE_NAME}"')
-        else:
-            print("❌  Failed. Try running this script as Administrator.")
+            # Install and start
+            old_argv = sys.argv[:]
+            sys.argv = [SCRIPT_PATH, "--startup", "auto", "install"]
+            win32serviceutil.HandleCommandLine(HydraService)
+            sys.argv = old_argv
+            win32serviceutil.StartService("Hydra")
+            print("  ✅ Hydra service installed and running!")
+            print()
+            print("  📋 View:      Task Manager → Services tab → Hydra")
+            print("  ⏹  Stop:      Right-click Hydra → Stop")
+            print("  🗑  Uninstall: python main.py --uninstall  (as Administrator)")
+        except Exception as e:
+            print(f"  ❌ {e}")
+            print("  Try: Right-click terminal → Run as administrator")
+        print()
 
-        # Windows does not require a separate permission step — camera just works.
-        print("\n✅  No extra permission steps needed on Windows.")
-
-    # ── Linux ────────────────────────────────────────────────────
+    # ── Linux ─────────────────────────────────────────────────
     elif SYSTEM == "Linux":
         svc_dir  = os.path.expanduser("~/.config/systemd/user")
         svc_path = os.path.join(svc_dir, f"{SERVICE_NAME}.service")
-        log_path = os.path.join(SCRIPT_DIR, "camera_stream.log")
+        log_path = os.path.join(SCRIPT_DIR, "hydra.log")
         os.makedirs(svc_dir, exist_ok=True)
 
-        svc = f"""[Unit]
-Description=Camera Stream Service
+        with open(svc_path, "w") as f:
+            f.write(f"""[Unit]
+Description=Hydra Camera Stream
 After=network-online.target
 Wants=network-online.target
 
@@ -918,20 +855,17 @@ StandardError=append:{log_path}
 
 [Install]
 WantedBy=default.target
-"""
-        with open(svc_path, "w") as f:
-            f.write(svc)
+""")
 
         _run_cmd("systemctl --user daemon-reload")
         _run_cmd(f"systemctl --user enable {SERVICE_NAME}")
         r = _run_cmd(f"systemctl --user start {SERVICE_NAME}")
-
         username = os.environ.get("USER", "")
         if username:
             _run_cmd(f"loginctl enable-linger {username}", check=False)
 
         if r.returncode == 0:
-            print(f"✅  systemd service installed — starts on every boot.")
+            print(f"✅  Hydra service installed — starts on every boot.")
             print(f"ℹ️   Logs: journalctl --user -u {SERVICE_NAME} -f")
         else:
             print(f"❌  Failed. Check: journalctl --user -u {SERVICE_NAME}")
@@ -941,26 +875,39 @@ WantedBy=default.target
 
 
 def uninstall_startup():
-    print(f"\n🗑  Removing auto-startup on {SYSTEM}...\n")
+    print(f"\n🗑  Removing Hydra on {SYSTEM}...\n")
     if SYSTEM == "Windows":
-        _run_cmd(f'schtasks /Delete /TN "{SERVICE_NAME}" /F')
-        print(f"✅  Removed Task Scheduler entry '{SERVICE_NAME}'.")
+        try:
+            import win32serviceutil
+            try: win32serviceutil.StopService("Hydra")
+            except Exception: pass
+            win32serviceutil.RemoveService("Hydra")
+            print("  ✅ Hydra removed from Windows Services.")
+        except ImportError:
+            _run_cmd("sc stop Hydra",   check=False)
+            _run_cmd("sc delete Hydra", check=False)
+            print("  ✅ Hydra removed via sc.exe")
+        except Exception as e:
+            print(f"  ❌ {e}")
+            print("  Try running as Administrator.")
     elif SYSTEM == "Darwin":
-        plist_path = os.path.expanduser(f"~/Library/LaunchAgents/{SERVICE_LABEL}.plist")
-        uid_r = subprocess.run(["id", "-u"], capture_output=True, text=True)
-        uid   = uid_r.stdout.strip()
+        plist_path = os.path.expanduser(
+            f"~/Library/LaunchAgents/{SERVICE_LABEL}.plist")
+        uid = subprocess.run(["id", "-u"],
+                             capture_output=True, text=True).stdout.strip()
         _run_cmd(f"launchctl bootout gui/{uid} '{plist_path}'", check=False)
-        _run_cmd(f"launchctl unload '{plist_path}'",            check=False)
+        _run_cmd(f"launchctl unload '{plist_path}'", check=False)
         if os.path.exists(plist_path):
             os.remove(plist_path)
-        print(f"✅  Removed launchd agent: {SERVICE_LABEL}")
+        print(f"✅  Removed Hydra launchd agent.")
     elif SYSTEM == "Linux":
         _run_cmd(f"systemctl --user stop {SERVICE_NAME}",    check=False)
         _run_cmd(f"systemctl --user disable {SERVICE_NAME}", check=False)
-        svc_path = os.path.expanduser(f"~/.config/systemd/user/{SERVICE_NAME}.service")
+        svc_path = os.path.expanduser(
+            f"~/.config/systemd/user/{SERVICE_NAME}.service")
         if os.path.exists(svc_path): os.remove(svc_path)
         _run_cmd("systemctl --user daemon-reload", check=False)
-        print(f"✅  Removed systemd service: {SERVICE_NAME}")
+        print(f"✅  Removed Hydra systemd service.")
     print()
 
 
@@ -969,7 +916,6 @@ def uninstall_startup():
 # ─────────────────────────────────────────────────────────────
 
 def auto_install_packages():
-    """Install any missing laptop packages automatically."""
     packages = [
         ("cv2",       "opencv-python"),
         ("socketio",  "python-socketio[client]"),
@@ -981,7 +927,7 @@ def auto_install_packages():
             __import__(mod)
         except ImportError:
             all_ok = False
-            print(f"   📦 Installing {pkg} ...")
+            print(f"   📦 Installing {pkg}...")
             r = subprocess.run(
                 [sys.executable, "-m", "pip", "install", pkg, "-q"],
                 capture_output=True, text=True
@@ -989,69 +935,31 @@ def auto_install_packages():
             if r.returncode == 0:
                 print(f"   ✅ {pkg} installed")
             else:
-                print(f"   ❌ Failed to install {pkg}")
-                print(f"      Run manually:  pip install \"{pkg}\"")
+                print(f"   ❌ Failed — run manually:  pip install \"{pkg}\"")
     if all_ok:
-        print("   ✅ All packages already installed")
-
-
-# ─────────────────────────────────────────────────────────────
-#  SAVE SERVER URL BACK INTO THIS FILE
-# ─────────────────────────────────────────────────────────────
-
-def save_server_url(new_url):
-    """Write the new SERVER_URL into this script so it persists."""
-    try:
-        import re
-        with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
-            content = f.read()
-        content = re.sub(
-            r'SERVER_URL\s*=\s*"[^"]*"',
-            f'SERVER_URL = "{new_url}"',
-            content, count=1
-        )
-        with open(SCRIPT_PATH, "w", encoding="utf-8") as f:
-            f.write(content)
-        global SERVER_URL
-        SERVER_URL = new_url
-        print(f"   ✅ URL saved — no need to edit the file manually.")
-    except Exception as e:
-        print(f"   ⚠️  Could not save URL automatically: {e}")
-        print(f"      Edit SERVER_URL at the top of main.py manually.")
+        print("   ✅ All packages ready")
 
 
 # ─────────────────────────────────────────────────────────────
 #  FIRST-RUN SETUP  (runs once, skipped forever after)
 # ─────────────────────────────────────────────────────────────
 
-MARKER_FILE = os.path.join(SCRIPT_DIR, ".camdash_ready")
-
 def first_run_setup():
-    """
-    Runs automatically on first launch only — fully silent, no prompts.
-    Installs packages and auto-startup without asking any questions.
-    After this, future runs go straight to streaming.
-    Camera only activates when someone taps it on the phone dashboard.
-    """
     if os.path.exists(MARKER_FILE):
-        return  # Already configured — skip silently
+        return  # Already set up — skip silently
 
     print("""
 ╔══════════════════════════════════════════════════════╗
-║         CAMDASH — SETTING UP (first time only)       ║
+║         HYDRA — FIRST TIME SETUP                     ║
+║         (This only runs once)                        ║
 ╚══════════════════════════════════════════════════════╝
 """)
-
-    # ── Step 1: Install packages silently ─────────────────────
-    print("  [1/2] Installing required packages...")
+    print("  [1/2] Installing packages...")
     auto_install_packages()
     print()
-
-    # ── Step 2: Install auto-startup silently ─────────────────
     print("  [2/2] Installing auto-startup...")
     install_startup()
 
-    # ── Mark setup as done ────────────────────────────────────
     try:
         open(MARKER_FILE, "w").write("ready")
     except Exception:
@@ -1059,9 +967,27 @@ def first_run_setup():
 
     print()
     print("  " + "─" * 50)
-    print("  ✅  Setup complete! Starting stream...")
-    print("  ✅  Camera activates only when viewed on phone.")
+    print("  ✅  Setup complete! Starting camera stream...")
     print("  " + "─" * 50 + "\n")
+
+
+# ─────────────────────────────────────────────────────────────
+#  UAC AUTO-ELEVATION (Windows — triggers on double-click)
+# ─────────────────────────────────────────────────────────────
+
+def _ensure_admin():
+    if SYSTEM != "Windows":
+        return
+    try:
+        import ctypes
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return  # already admin
+        params = " ".join(f'"{a}"' for a in sys.argv)
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, params, SCRIPT_DIR, 1)
+        sys.exit(0)
+    except Exception:
+        pass  # if elevation fails, continue anyway
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1071,12 +997,12 @@ def first_run_setup():
 def print_help():
     print("""
 ╔══════════════════════════════════════════════════════════╗
-║            CAMDASH — USAGE                               ║
+║            HYDRA — USAGE                                 ║
 ╠══════════════════════════════════════════════════════════╣
-║  python main.py              Auto-setup + stream         ║
+║  python main.py              First-time setup + stream   ║
 ║  python main.py --server     Run relay server (Render)   ║
-║  python main.py --install    Re-run auto-startup setup   ║
-║  python main.py --uninstall  Remove auto-start           ║
+║  python main.py --install    Re-install auto-startup     ║
+║  python main.py --uninstall  Remove auto-startup         ║
 ║  python main.py --check      Verify everything is ready  ║
 ║  python main.py --reset      Redo first-time setup       ║
 ║  python main.py --help       Show this message           ║
@@ -1084,6 +1010,8 @@ def print_help():
 """)
 
 if __name__ == "__main__":
+    _ensure_admin()   # Windows: auto-UAC popup on double-click
+
     args = sys.argv[1:]
     if "--help" in args or "-h" in args:
         print_help()
@@ -1098,9 +1026,9 @@ if __name__ == "__main__":
     elif "--reset" in args:
         if os.path.exists(MARKER_FILE):
             os.remove(MARKER_FILE)
-            print("🔄  Reset done — run  python main.py  to redo setup.")
+            print("🔄  Reset done — double-click main.py to redo setup.")
         else:
-            print("ℹ️   Already fresh — no marker found.")
+            print("ℹ️   Already fresh.")
     else:
-        first_run_setup()   # runs once on first launch, skipped forever after
+        first_run_setup()
         run_laptop()
